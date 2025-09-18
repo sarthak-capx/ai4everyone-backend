@@ -12,7 +12,7 @@ const router = express.Router();
 
 // Configuration
 const INFERENCE_API_URL = 'https://api.inference.net/v1';
-const FAL_API_URL = process.env.FAL_API_KEY || 'https://fal.run';
+const FAL_API_URL = process.env.FAL_API_URL || 'https://fal.run';
 const FAL_API_KEY = process.env.FAL_API_KEY;
 
 // Helper function to validate API key
@@ -28,29 +28,23 @@ export async function validateApiKey(apiKey: string): Promise<boolean> {
 
 // Helper to get user_id from API key
 export async function getUserIdFromApiKey(apiKey: string): Promise<string | null> {
-  // Try new secure validation first, fallback to old system
   try {
-    // Check if it's a new format API key
-    if (apiKey.startsWith('capx_') && apiKey.length > 12) {
-      const prefix = apiKey.substring(0, 12);
-      const checksum = crypto.createHash('sha256').update(apiKey).digest('hex').substring(0, 8);
-      
-      // Try new secure validation
-      const { data: newData } = await supabaseAnon.rpc('get_user_id_from_api_key', { api_key_prefix: prefix });
-      if (newData) {
-        // Update last_used_at
-        await supabaseAnon.rpc('validate_and_update_api_key', { api_key_prefix: prefix, api_key_checksum: checksum });
-        return newData as unknown as string;
-      }
+    // Single secure path: server-side validation of full API key
+    const { data, error } = await supabaseAnon.rpc('validate_and_update_api_key', {
+      p_api_key: apiKey,
+      p_user_ip: null
+    });
+    if (error) {
+      return null;
     }
-    
-    // Fallback to old system
-    const { data } = await supabaseAnon.rpc('resolve_api_key_user_id', { p_key: apiKey }).single();
-    if (data) return data as unknown as string;
+    if (data && (data as any).valid && (data as any).user_id) {
+      return (data as any).user_id as string;
+    }
+    return null;
   } catch (error) {
     console.error('API key validation error:', error);
+    return null;
   }
-  return null;
 }
 
 
@@ -366,10 +360,10 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
     // Multi-provider logic
     let provider = req.body.provider || 'capx_textmodels';
     if (provider === 'capx_ivmodels') {
-          if (process.env.NODE_ENV !== 'production') {
-      // console.log('[proxy.ts] FAL provider branch entered');
+      if (process.env.NODE_ENV !== 'production') {
+        // console.log('[proxy.ts] FAL provider branch entered');
 
-    }
+      }
       if (!FAL_API_KEY) {
         console.error('FAL_API_KEY is not set in the environment!');
         return res.status(500).json({ error: 'FAL API key not configured.' });
@@ -377,7 +371,7 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
 
       // Dynamic cost calculation based on actual parameters - CRITICAL FIX!
       function calculateRealFalCost(appId: string, requestBody: any): number {
-        
+
         // IMPROVED: Extract duration from multiple possible parameter names with validation
         function extractDuration(requestBody: any, defaultDuration: number = 60): number {
           const durationParams = [
@@ -394,64 +388,64 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             requestBody.duration_ms && requestBody.duration_ms / 1000, // Convert milliseconds
             requestBody.time_seconds
           ];
-          
+
           // Find the first valid duration parameter
           for (const param of durationParams) {
             if (param !== undefined && param !== null && typeof param === 'number' && param > 0 && param <= 3600) {
-      
+
               return Math.max(param, 0.1); // Minimum 0.1 seconds
             }
           }
-          
-  
+
+
           return defaultDuration;
         }
-        
+
         // IMPROVED: Extract dimensions from multiple possible parameter names with validation
         function extractDimensions(requestBody: any): { width: number; height: number } {
           // Try various parameter names for width
-          const width = requestBody.width || 
-                       requestBody.image_width || 
-                       requestBody.output_width || 
-                       requestBody.w ||
-                       (requestBody.size && typeof requestBody.size === 'object' ? requestBody.size.width : null) ||
-                       (requestBody.dimensions && requestBody.dimensions.width) ||
-                       (requestBody.resolution && requestBody.resolution.width) ||
-                       1024;
+          const width = requestBody.width ||
+            requestBody.image_width ||
+            requestBody.output_width ||
+            requestBody.w ||
+            (requestBody.size && typeof requestBody.size === 'object' ? requestBody.size.width : null) ||
+            (requestBody.dimensions && requestBody.dimensions.width) ||
+            (requestBody.resolution && requestBody.resolution.width) ||
+            1024;
 
           // Try various parameter names for height  
-          const height = requestBody.height || 
-                        requestBody.image_height || 
-                        requestBody.output_height || 
-                        requestBody.h ||
-                        (requestBody.size && typeof requestBody.size === 'object' ? requestBody.size.height : null) ||
-                        (requestBody.dimensions && requestBody.dimensions.height) ||
-                        (requestBody.resolution && requestBody.resolution.height) ||
-                        1024;
+          const height = requestBody.height ||
+            requestBody.image_height ||
+            requestBody.output_height ||
+            requestBody.h ||
+            (requestBody.size && typeof requestBody.size === 'object' ? requestBody.size.height : null) ||
+            (requestBody.dimensions && requestBody.dimensions.height) ||
+            (requestBody.resolution && requestBody.resolution.height) ||
+            1024;
 
           // Validate dimensions (must be positive numbers, reasonable limits)
           const validWidth = Math.max(64, Math.min(8192, Math.floor(Number(width)) || 1024));
           const validHeight = Math.max(64, Math.min(8192, Math.floor(Number(height)) || 1024));
-          
+
           return { width: validWidth, height: validHeight };
         }
-        
+
         // IMPROVED: Extract text from multiple possible parameter names with validation  
         function extractText(requestBody: any): string {
-          const text = requestBody.text || 
-                      requestBody.prompt || 
-                      requestBody.lyrics || 
-                      requestBody.input_text ||
-                      requestBody.message ||
-                      requestBody.content ||
-                      requestBody.query ||
-                      requestBody.instruction ||
-                      '';
-          
+          const text = requestBody.text ||
+            requestBody.prompt ||
+            requestBody.lyrics ||
+            requestBody.input_text ||
+            requestBody.message ||
+            requestBody.content ||
+            requestBody.query ||
+            requestBody.instruction ||
+            '';
+
           // Return trimmed text, ensure it's a string
           return typeof text === 'string' ? text.trim() : String(text || '').trim();
         }
-        
+
         // Video models with duration-based pricing
         const VIDEO_DURATION_MODELS: { [key: string]: number } = {
           'Veo2': 0.50,
@@ -473,7 +467,7 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
           'ace-step': 0.0055,  // Uses duration parameter (moved from FLAT_RATE)
           'elevenlabs/sound-effects': 0.0037  // Uses duration_seconds parameter ($0.11/30sec = $0.0037/sec)
         };
-        
+
         // Flat rate models (removed duration-based models)
         const FLAT_RATE_MODELS: { [key: string]: number } = {
           'ltx-video-13b-dev': 0.20,
@@ -533,22 +527,22 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
           'ltx-video-13b-distilled/extend': 0.15,
           'ltx-video-13b-dev/extend': 0.20,
         };
-        
+
         // Clean appId (remove fal-ai/ prefix)
         const cleanAppId = appId.replace('fal-ai/', '');
-        
+
         // Check for duration-based models
         if (VIDEO_DURATION_MODELS[cleanAppId]) {
           const duration = extractDuration(requestBody, 5); // Default 5 seconds for video
           const ratePerSecond = VIDEO_DURATION_MODELS[cleanAppId];
           const costUsd = duration * ratePerSecond;
-  
+
           const costCents = costUsd * 100; // NO ROUNDING - PRECISE BILLING!
           // Apply 20% markup for non-text models
           const finalCostCents = provider !== 'capx_textmodels' ? costCents * 1.2 : costCents;
           return finalCostCents;
         }
-        
+
         // Check for flat rate models
         if (cleanAppId === 'trellis') {
           // Hardcode final cost for trellis to 0.024 USD (2.4 cents)
@@ -562,7 +556,7 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
           const finalCostCents = provider !== 'capx_textmodels' ? costCents * 1.2 : costCents;
           return finalCostCents;
         }
-        
+
         // Megapixel-based models (images)
         const MEGAPIXEL_MODELS: { [key: string]: number } = {
           'HiDream-i1-full': 0.05,  // Moved from flat rate for megapixel pricing
@@ -581,10 +575,10 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
           'codeformer': 0.0021,     // Newly added image-to-image
           'ben/v2/video': 0.001
         };
-        
+
         if (MEGAPIXEL_MODELS[cleanAppId]) {
           let megapixels;
-          
+
           if (cleanAppId === 'ben/v2/video' && requestBody._videoMetadata) {
             // 🎯 USE REAL VIDEO ANALYSIS DATA
             megapixels = requestBody._videoMetadata.megapixels;
@@ -596,25 +590,25 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             const { width, height } = extractDimensions(requestBody);
             megapixels = (width * height) / 1000000;
           }
-          
+
           const ratePerMP = MEGAPIXEL_MODELS[cleanAppId];
           const costUsd = megapixels * ratePerMP;
           const costCents = costUsd * 100; // NO ROUNDING - PRECISE BILLING!
           // Apply 20% markup for non-text models
           const finalCostCents = provider !== 'capx_textmodels' ? costCents * 1.2 : costCents;
-          
 
-          
+
+
           return finalCostCents;
         }
-        
+
         // Character-based models (TTS)
         const CHAR_MODELS: { [key: string]: number } = {
           'elevenlabs/tts/multilingual-v2': 0.11,
           'kokoro/brazilian-portuguese': 0.022,
           'kokoro/hindi': 0.022
         };
-        
+
         if (CHAR_MODELS[cleanAppId]) {
           const text = extractText(requestBody);
           const charCount = text.length || 100; // Default 100 chars
@@ -625,62 +619,62 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
           const finalCostCents = provider !== 'capx_textmodels' ? costCents * 1.2 : costCents;
           return finalCostCents;
         }
-        
+
         // Audio duration models (for transcription/speech-to-text) - ESTIMATION-BASED MODELS ONLY
         const AUDIO_DURATION_MODELS: { [key: string]: number } = {
           'elevenlabs/speech-to-text': 0.03,  // Per minute, will be converted to seconds
           'speech-to-text/turbo': 0.0008,  // Per second  
           'speech-to-text/turbo/stream': 0.0008,  // Per second
         };
-        
+
         // Compute-time-based models (charge per actual processing time) - DYNAMIC BILLING MODELS
         const COMPUTE_TIME_MODELS: { [key: string]: number } = {
           'wizper': 0.002,  // $0.002 per compute second
           'whisper': 0.002,  // $0.002 per compute second (UPDATED PRICING - WAS 0.008)
           'smart-turn': 0.002,  // $0.002 per compute second (UPDATED PRICING - WAS 0.008)
         };
-        
+
         if (AUDIO_DURATION_MODELS[cleanAppId]) {
           const duration = extractDuration(requestBody, 60); // Default 1 minute for audio
           const rate = AUDIO_DURATION_MODELS[cleanAppId];
-          
 
-          
+
+
           let costUsd = 0;
           if (cleanAppId === 'elevenlabs/speech-to-text') {
             // Special case: elevenlabs charges per minute
             const durationMinutes = duration / 60;
             costUsd = durationMinutes * rate;  // Convert seconds to minutes
-  
+
           } else {
             // All other audio-to-text models charge per second
             costUsd = duration * rate;
 
           }
-          
+
           const costCents = costUsd * 100; // NO ROUNDING - PRECISE BILLING!
           // Apply 20% markup for non-text models
           const finalCostCents = provider !== 'capx_textmodels' ? costCents * 1.2 : costCents;
 
-          
 
-          
+
+
           return finalCostCents;
         }
-        
+
         // Check for compute-time-based models (DYNAMIC BILLING!)
         if (COMPUTE_TIME_MODELS[cleanAppId]) {
-          
+
           // DON'T OVERWRITE EXISTING TIMING DATA (important for multiple calls)
           if (!requestBody._computeEstimate || !requestBody._computeEstimate.isRealTimeMeasurement) {
             // Start timing for ACTUAL processing measurement (upload → response)
             const startTime = Date.now();
             requestBody._computeStartTime = startTime;
-            
+
             // Get audio duration for logging purposes
             const audioDuration = extractDuration(requestBody, 60);
             const ratePerComputeSecond = COMPUTE_TIME_MODELS[cleanAppId];
-            
+
             // Store data for real-time calculation when we get the response
             requestBody._computeEstimate = {
               audioDuration,
@@ -693,37 +687,37 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
           } else {
             // Preserve existing timing data
           }
-          
 
-          
+
+
           return 0; // No upfront charge - charge based on actual processing time
         }
-        
+
         // IMPROVED FALLBACK: Try case-insensitive matching before failing
-        
+
         // Create case-insensitive lookup maps
         const allModels = {
           ...VIDEO_DURATION_MODELS,
-          ...FLAT_RATE_MODELS, 
+          ...FLAT_RATE_MODELS,
           ...MEGAPIXEL_MODELS,
           ...CHAR_MODELS,
           ...AUDIO_DURATION_MODELS,
           ...COMPUTE_TIME_MODELS
         };
-        
+
         // Try case-insensitive matching
         const modelKeys = Object.keys(allModels);
-        const caseInsensitiveMatch = modelKeys.find(key => 
+        const caseInsensitiveMatch = modelKeys.find(key =>
           key.toLowerCase() === cleanAppId.toLowerCase()
         );
-        
+
         if (caseInsensitiveMatch) {
           // Recursively call with the correct case
           return calculateRealFalCost(caseInsensitiveMatch, requestBody);
         }
-        
+
         // FINAL FALLBACK: Throw error instead of charging wrong amount
-        
+
         // Don't charge anything - throw error for proper handling
         throw new Error(`PRICING_ERROR: Model "${cleanAppId}" not found in pricing database. Available models: ${Object.keys(allModels).length} total.`);
       }
@@ -740,19 +734,19 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
         if ((appId === 'fal-ai/ace-step' || appId === 'ace-step') && req.body.source === 'playground') {
           // Playground: hardcoded/defaults
           falPayload = {
-              tags: 'lofi, hiphop, drum and bass, trap, chill',
+            tags: 'lofi, hiphop, drum and bass, trap, chill',
             lyrics: req.body.prompt,
-              duration: 10,
-              number_of_steps: 27,
-              scheduler: 'euler',
-              guidance_type: 'apg',
-              granularity_scale: 10,
-              guidance_interval: 0.5,
-              guidance_interval_decay: 0,
-              guidance_scale: 15,
-              minimum_guidance_scale: 3,
-              tag_guidance_scale: 5,
-              lyric_guidance_scale: 1.5
+            duration: 10,
+            number_of_steps: 27,
+            scheduler: 'euler',
+            guidance_type: 'apg',
+            granularity_scale: 10,
+            guidance_interval: 0.5,
+            guidance_interval_decay: 0,
+            guidance_scale: 15,
+            minimum_guidance_scale: 3,
+            tag_guidance_scale: 5,
+            lyric_guidance_scale: 1.5
           };
         } else if (appId === 'fal-ai/ace-step' || appId === 'ace-step') {
           // External API: require all params from req.body
@@ -893,28 +887,28 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!audio_file_base64 || !prompt) {
               return res.status(400).json({ error: 'Missing required fields for playai/inpaint/diffusion playground: audio_file_base64, prompt' });
             }
-            
+
             // Upload audio file using Fal client
             // Strip data URI prefix if present
             let fileData = audio_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(audio_file_base64);
             if (match) fileData = match[1];
-            
+
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Convert base64 to buffer
             const buffer = Buffer.from(fileData, 'base64');
-            
+
             // Create a Blob with proper MIME type
             const blob = new Blob([buffer], { type: 'audio/mpeg' });
-            
+
             // Add file properties to the blob
             Object.defineProperty(blob, 'name', {
               value: 'audio.mp3',
               writable: false
             });
-            
+
             // Upload file to Fal storage
             let audio_url;
             try {
@@ -924,13 +918,13 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
               console.error('Failed to upload file to Fal storage:', uploadError);
               return res.status(500).json({ error: 'Failed to upload audio file to storage.' });
             }
-            
+
             // Validate that we got a proper URL
             if (!audio_url || typeof audio_url !== 'string' || !audio_url.startsWith('http')) {
               console.error('Invalid audio URL returned from Fal storage:', audio_url);
               return res.status(500).json({ error: 'Invalid audio URL returned from storage.' });
             }
-            
+
             // Hardcoded demo values for playground
             falPayload = {
               audio_url,
@@ -974,28 +968,28 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!audio_file_base64 || !prompt) {
               return res.status(400).json({ error: 'Missing required fields for ace-step/audio-outpaint playground: audio_file_base64, prompt' });
             }
-            
+
             // Upload audio file using Fal client (same approach as playai/inpaint/diffusion)
             // Strip data URI prefix if present
             let fileData = audio_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(audio_file_base64);
             if (match) fileData = match[1];
-            
+
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Convert base64 to buffer
             const buffer = Buffer.from(fileData, 'base64');
-            
+
             // Create a Blob with proper MIME type
             const blob = new Blob([buffer], { type: 'audio/mpeg' });
-            
+
             // Add file properties to the blob
             Object.defineProperty(blob, 'name', {
               value: 'audio.mp3',
               writable: false
             });
-            
+
             // Upload file to Fal storage
             let audio_url;
             try {
@@ -1005,13 +999,13 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
               console.error('Failed to upload file to Fal storage:', uploadError);
               return res.status(500).json({ error: 'Failed to upload audio file to storage.' });
             }
-            
+
             // Validate that we got a proper URL
             if (!audio_url || typeof audio_url !== 'string' || !audio_url.startsWith('http')) {
               console.error('Invalid audio URL returned from Fal storage:', audio_url);
               return res.status(500).json({ error: 'Invalid audio URL returned from storage.' });
             }
-            
+
             // Use flat structure (confirmed working with curl testing)
             falPayload = {
               audio_url: audio_url,
@@ -1055,28 +1049,28 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!audio_file_base64 || !prompt) {
               return res.status(400).json({ error: 'Missing required fields for ace-step/audio-inpaint playground: audio_file_base64, prompt' });
             }
-            
+
             // Upload audio file using Fal client (same approach as audio-outpaint)
             // Strip data URI prefix if present
             let fileData = audio_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(audio_file_base64);
             if (match) fileData = match[1];
-            
+
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Convert base64 to buffer
             const buffer = Buffer.from(fileData, 'base64');
-            
+
             // Use WAV format for better compatibility with ace-step/audio-inpaint
             const blob = new Blob([buffer], { type: 'audio/wav' });
-            
+
             // Add file properties to the blob
             Object.defineProperty(blob, 'name', {
               value: 'audio.wav',
               writable: false
             });
-            
+
             // Upload file to Fal storage
             let audio_url;
             try {
@@ -1086,13 +1080,13 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
               console.error('Failed to upload file to Fal storage:', uploadError);
               return res.status(500).json({ error: 'Failed to upload audio file to storage.' });
             }
-            
+
             // Validate that we got a proper URL
             if (!audio_url || typeof audio_url !== 'string' || !audio_url.startsWith('http')) {
               console.error('Invalid audio URL returned from Fal storage:', audio_url);
               return res.status(500).json({ error: 'Invalid audio URL returned from storage.' });
             }
-            
+
             // Use flat structure (confirmed working with curl testing)
             falPayload = {
               audio_url: audio_url,
@@ -1139,28 +1133,28 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!audio_file_base64 || !prompt) {
               return res.status(400).json({ error: 'Missing required fields for ace-step/audio-to-audio playground: audio_file_base64, prompt' });
             }
-            
+
             // Upload audio file using Fal client (same approach as other ace-step models)
             // Strip data URI prefix if present
             let fileData = audio_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(audio_file_base64);
             if (match) fileData = match[1];
-            
+
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Convert base64 to buffer
             const buffer = Buffer.from(fileData, 'base64');
-            
+
             // Use WAV format for better compatibility with ace-step models
             const blob = new Blob([buffer], { type: 'audio/wav' });
-            
+
             // Add file properties to the blob
             Object.defineProperty(blob, 'name', {
               value: 'audio.wav',
               writable: false
             });
-            
+
             // Upload file to Fal storage
             let audio_url;
             try {
@@ -1170,13 +1164,13 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
               console.error('Failed to upload file to Fal storage:', uploadError);
               return res.status(500).json({ error: 'Failed to upload audio file to storage.' });
             }
-            
+
             // Validate that we got a proper URL
             if (!audio_url || typeof audio_url !== 'string' || !audio_url.startsWith('http')) {
               console.error('Invalid audio URL returned from Fal storage:', audio_url);
               return res.status(500).json({ error: 'Invalid audio URL returned from storage.' });
             }
-            
+
             // Use flat structure (confirmed working with curl testing)
             // For audio-to-audio, we need both original_tags and tags
             falPayload = {
@@ -1224,29 +1218,29 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_file_base64) {
               return res.status(400).json({ error: 'Missing required field for hunyuan3d-v21 playground: image_file_base64' });
             }
-            
+
             // Upload image file using Fal client
             // Strip data URI prefix if present
             let fileData = image_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(image_file_base64);
             if (match) fileData = match[1];
-            
+
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Convert base64 to buffer
             const buffer = Buffer.from(fileData, 'base64');
-            
+
             // Detect image MIME type or use default
             let mimeType = 'image/png';
             const originalMatch = /^data:(.*?);base64,/.exec(image_file_base64);
             if (originalMatch && originalMatch[1]) {
               mimeType = originalMatch[1];
             }
-            
+
             // Create a Blob with detected MIME type
             const blob = new Blob([buffer], { type: mimeType });
-            
+
             // Use appropriate file extension based on MIME type
             let fileExtension = '.png';
             if (mimeType.includes('jpeg') || mimeType.includes('jpg')) {
@@ -1256,13 +1250,13 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             } else if (mimeType.includes('webp')) {
               fileExtension = '.webp';
             }
-            
+
             // Add file properties to the blob
             Object.defineProperty(blob, 'name', {
               value: `image${fileExtension}`,
               writable: false
             });
-            
+
             // Upload file to Fal storage
             let input_image_url;
             try {
@@ -1272,13 +1266,13 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
               console.error('Failed to upload file to Fal storage:', uploadError);
               return res.status(500).json({ error: 'Failed to upload image file to storage.' });
             }
-            
+
             // Validate that we got a proper URL
             if (!input_image_url || typeof input_image_url !== 'string' || !input_image_url.startsWith('http')) {
               console.error('Invalid image URL returned from Fal storage:', input_image_url);
               return res.status(500).json({ error: 'Invalid image URL returned from storage.' });
             }
-            
+
             // Use flat structure (confirmed working with curl testing)
             falPayload = {
               input_image_url: input_image_url,
@@ -1315,34 +1309,34 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_files_base64 || !Array.isArray(image_files_base64) || image_files_base64.length === 0) {
               return res.status(400).json({ error: 'Missing required field for trellis/multi playground: image_files_base64 (array of images)' });
             }
-            
+
             // Upload all image files using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             let image_urls = [];
-            
+
             for (let i = 0; i < image_files_base64.length; i++) {
               const base64 = image_files_base64[i];
-              
+
               // Strip data URI prefix if present
               let fileData = base64;
               const match = /^data:.*;base64,(.*)$/.exec(base64);
               if (match) fileData = match[1];
-              
+
               // Convert base64 to buffer
               const buffer = Buffer.from(fileData, 'base64');
-              
+
               // Detect image MIME type or use default
               let mimeType = 'image/png';
               const originalMatch = /^data:(.*?);base64,/.exec(base64);
               if (originalMatch && originalMatch[1]) {
                 mimeType = originalMatch[1];
               }
-              
+
               // Create a Blob with detected MIME type
               const blob = new Blob([buffer], { type: mimeType });
-              
+
               // Use appropriate file extension based on MIME type
               let fileExtension = '.png';
               if (mimeType.includes('jpeg') || mimeType.includes('jpg')) {
@@ -1352,13 +1346,13 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
               } else if (mimeType.includes('webp')) {
                 fileExtension = '.webp';
               }
-              
+
               // Add file properties to the blob
               Object.defineProperty(blob, 'name', {
                 value: `image_${i}${fileExtension}`,
                 writable: false
               });
-              
+
               // Upload file to Fal storage
               try {
                 const image_url = await fal.storage.upload(blob);
@@ -1369,13 +1363,13 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
                 return res.status(500).json({ error: `Failed to upload image ${i} to storage.` });
               }
             }
-            
+
             // Validate that we got proper URLs
             if (image_urls.length === 0) {
               console.error('No valid image URLs returned from Fal storage');
               return res.status(500).json({ error: 'No valid image URLs returned from storage.' });
             }
-            
+
             // Use flat structure (confirmed working with curl testing)
             falPayload = {
               image_urls: image_urls,
@@ -1418,34 +1412,34 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_files_base64 || !Array.isArray(image_files_base64) || image_files_base64.length === 0) {
               return res.status(400).json({ error: 'Missing required field for hunyuan3d/v2 playground: image_files_base64 (array of images)' });
             }
-            
+
             // Upload all image files using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             let image_urls = [];
-            
+
             for (let i = 0; i < image_files_base64.length; i++) {
               const base64 = image_files_base64[i];
-              
+
               // Strip data URI prefix if present
               let fileData = base64;
               const match = /^data:.*;base64,(.*)$/.exec(base64);
               if (match) fileData = match[1];
-              
+
               // Convert base64 to buffer
               const buffer = Buffer.from(fileData, 'base64');
-              
+
               // Detect image MIME type or use default
               let mimeType = 'image/png';
               const originalMatch = /^data:(.*?);base64,/.exec(base64);
               if (originalMatch && originalMatch[1]) {
                 mimeType = originalMatch[1];
               }
-              
+
               // Create a Blob with detected MIME type
               const blob = new Blob([buffer], { type: mimeType });
-              
+
               // Use appropriate file extension based on MIME type
               let fileExtension = '.png';
               if (mimeType.includes('jpeg') || mimeType.includes('jpg')) {
@@ -1455,13 +1449,13 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
               } else if (mimeType.includes('webp')) {
                 fileExtension = '.webp';
               }
-              
+
               // Add file properties to the blob
               Object.defineProperty(blob, 'name', {
                 value: `image_${i}${fileExtension}`,
                 writable: false
               });
-              
+
               // Upload file to Fal storage
               try {
                 const image_url = await fal.storage.upload(blob);
@@ -1472,13 +1466,13 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
                 return res.status(500).json({ error: `Failed to upload image ${i} to storage.` });
               }
             }
-            
+
             // Validate that we got proper URLs
             if (image_urls.length === 0) {
               console.error('No valid image URLs returned from Fal storage');
               return res.status(500).json({ error: 'No valid image URLs returned from storage.' });
             }
-            
+
             // Use flat structure (confirmed working with curl testing)
             // For single image, use input_image_url. For multiple images, use front/back/left format (assuming up to 3 images)
             if (image_urls.length === 1) {
@@ -1509,7 +1503,7 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!input_image_url && !front_image_url) {
               return res.status(400).json({ error: 'Missing required field for hunyuan3d/v2: input_image_url or front_image_url' });
             }
-            
+
             // Use flat structure (same as playground)
             if (input_image_url) {
               // Single image mode
@@ -1544,35 +1538,35 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             // Playground mode: support both text-to-3D and image-to-3D
             // Check if images are provided for Image-to-3D mode
             const { image_files_base64, prompt } = req.body;
-            
+
             if (image_files_base64 && Array.isArray(image_files_base64) && image_files_base64.length > 0) {
               // Image-to-3D mode: upload images and use them
               const { fal } = require('@fal-ai/client');
               fal.config({ credentials: FAL_API_KEY });
-              
+
               let image_urls = [];
-              
+
               for (let i = 0; i < image_files_base64.length; i++) {
                 const base64 = image_files_base64[i];
-                
+
                 // Strip data URI prefix if present
                 let fileData = base64;
                 const match = /^data:.*;base64,(.*)$/.exec(base64);
                 if (match) fileData = match[1];
-                
+
                 // Convert base64 to buffer
                 const buffer = Buffer.from(fileData, 'base64');
-                
+
                 // Detect image MIME type or use default
                 let mimeType = 'image/png';
                 const originalMatch = /^data:(.*?);base64,/.exec(base64);
                 if (originalMatch && originalMatch[1]) {
                   mimeType = originalMatch[1];
                 }
-                
+
                 // Create a Blob with detected MIME type
                 const blob = new Blob([buffer], { type: mimeType });
-                
+
                 // Use appropriate file extension based on MIME type
                 let fileExtension = '.png';
                 if (mimeType.includes('jpeg') || mimeType.includes('jpg')) {
@@ -1582,13 +1576,13 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
                 } else if (mimeType.includes('webp')) {
                   fileExtension = '.webp';
                 }
-                
+
                 // Add file properties to the blob
                 Object.defineProperty(blob, 'name', {
                   value: `image_${i}${fileExtension}`,
                   writable: false
                 });
-                
+
                 // Upload file to Fal storage
                 try {
                   const image_url = await fal.storage.upload(blob);
@@ -1599,13 +1593,13 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
                   return res.status(500).json({ error: `Failed to upload image ${i} to storage.` });
                 }
               }
-              
+
               // Validate that we got proper URLs
               if (image_urls.length === 0) {
                 console.error('No valid image URLs returned from Fal storage');
                 return res.status(500).json({ error: 'No valid image URLs returned from storage.' });
               }
-              
+
               // Use flat structure for Image-to-3D mode
               falPayload = {
                 input_image_urls: image_urls,
@@ -1638,7 +1632,7 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!prompt && (!input_image_urls || !Array.isArray(input_image_urls) || input_image_urls.length === 0)) {
               return res.status(400).json({ error: 'Missing required field for hyper3d/rodin: either prompt (for Text-to-3D) or input_image_urls (for Image-to-3D)' });
             }
-            
+
             // Use flat structure (same as playground)
             falPayload = {
               prompt: req.body.prompt || "",
@@ -1665,29 +1659,29 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_file_base64) {
               return res.status(400).json({ error: 'Missing required field for trellis playground: image_file_base64' });
             }
-            
+
             // Upload image file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = image_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(image_file_base64);
             if (match) fileData = match[1];
-            
+
             // Convert base64 to buffer
             const buffer = Buffer.from(fileData, 'base64');
-            
+
             // Detect image MIME type or use default
             let mimeType = 'image/png';
             const originalMatch = /^data:(.*?);base64,/.exec(image_file_base64);
             if (originalMatch && originalMatch[1]) {
               mimeType = originalMatch[1];
             }
-            
+
             // Create a Blob with detected MIME type
             const blob = new Blob([buffer], { type: mimeType });
-            
+
             // Use appropriate file extension based on MIME type
             let fileExtension = '.png';
             if (mimeType.includes('jpeg') || mimeType.includes('jpg')) {
@@ -1697,13 +1691,13 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             } else if (mimeType.includes('webp')) {
               fileExtension = '.webp';
             }
-            
+
             // Add file properties to the blob
             Object.defineProperty(blob, 'name', {
               value: `image${fileExtension}`,
               writable: false
             });
-            
+
             // Upload file to Fal storage
             let image_url;
             try {
@@ -1713,13 +1707,13 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
               console.error('Failed to upload image to Fal storage:', uploadError);
               return res.status(500).json({ error: 'Failed to upload image to storage.' });
             }
-            
+
             // Validate that we got a proper URL
             if (!image_url || typeof image_url !== 'string' || !image_url.startsWith('http')) {
               console.error('Invalid image URL returned from Fal storage:', image_url);
               return res.status(500).json({ error: 'Invalid image URL returned from storage.' });
             }
-            
+
             // Use flat structure (consistent with other models)
             falPayload = {
               image_url: image_url,
@@ -1737,7 +1731,7 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_url) {
               return res.status(400).json({ error: 'Missing required field for trellis: image_url' });
             }
-            
+
             // Use flat structure (same as playground)
             falPayload = {
               image_url: req.body.image_url,
@@ -1760,29 +1754,29 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_file_base64) {
               return res.status(400).json({ error: 'Missing required field for triposr playground: image_file_base64' });
             }
-            
+
             // Upload image file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = image_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(image_file_base64);
             if (match) fileData = match[1];
-            
+
             // Convert base64 to buffer
             const buffer = Buffer.from(fileData, 'base64');
-            
+
             // Detect image MIME type or use default
             let mimeType = 'image/png';
             const originalMatch = /^data:(.*?);base64,/.exec(image_file_base64);
             if (originalMatch && originalMatch[1]) {
               mimeType = originalMatch[1];
             }
-            
+
             // Create a Blob with detected MIME type
             const blob = new Blob([buffer], { type: mimeType });
-            
+
             // Use appropriate file extension based on MIME type
             let fileExtension = '.png';
             if (mimeType.includes('jpeg') || mimeType.includes('jpg')) {
@@ -1792,13 +1786,13 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             } else if (mimeType.includes('webp')) {
               fileExtension = '.webp';
             }
-            
+
             // Add file properties to the blob
             Object.defineProperty(blob, 'name', {
               value: `image${fileExtension}`,
               writable: false
             });
-            
+
             // Upload file to Fal storage
             let image_url;
             try {
@@ -1808,13 +1802,13 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
               console.error('Failed to upload image to Fal storage:', uploadError);
               return res.status(500).json({ error: 'Failed to upload image to storage.' });
             }
-            
+
             // Validate that we got a proper URL
             if (!image_url || typeof image_url !== 'string' || !image_url.startsWith('http')) {
               console.error('Invalid image URL returned from Fal storage:', image_url);
               return res.status(500).json({ error: 'Invalid image URL returned from storage.' });
             }
-            
+
             // Use flat structure (consistent with other models)
             falPayload = {
               image_url: image_url,
@@ -1830,7 +1824,7 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_url) {
               return res.status(400).json({ error: 'Missing required field for triposr: image_url' });
             }
-            
+
             // Use flat structure (same as playground)
             falPayload = {
               image_url: req.body.image_url,
@@ -1850,29 +1844,29 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_file_base64) {
               return res.status(400).json({ error: 'Missing required field for chain-of-zoom playground: image_file_base64' });
             }
-            
+
             // Upload image file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = image_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(image_file_base64);
             if (match) fileData = match[1];
-            
+
             // Convert base64 to buffer
             const buffer = Buffer.from(fileData, 'base64');
-            
+
             // Detect image MIME type or use default
             let mimeType = 'image/png';
             const originalMatch = /^data:(.*?);base64,/.exec(image_file_base64);
             if (originalMatch && originalMatch[1]) {
               mimeType = originalMatch[1];
             }
-            
+
             // Create a Blob with detected MIME type
             const blob = new Blob([buffer], { type: mimeType });
-            
+
             // Use appropriate file extension based on MIME type
             let fileExtension = '.png';
             if (mimeType.includes('jpeg') || mimeType.includes('jpg')) {
@@ -1882,13 +1876,13 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             } else if (mimeType.includes('webp')) {
               fileExtension = '.webp';
             }
-            
+
             // Add file properties to the blob
             Object.defineProperty(blob, 'name', {
               value: `image${fileExtension}`,
               writable: false
             });
-            
+
             // Upload file to Fal storage
             let image_url;
             try {
@@ -1898,13 +1892,13 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
               console.error('Failed to upload image to Fal storage:', uploadError);
               return res.status(500).json({ error: 'Failed to upload image to storage.' });
             }
-            
+
             // Validate that we got a proper URL
             if (!image_url || typeof image_url !== 'string' || !image_url.startsWith('http')) {
               console.error('Invalid image URL returned from Fal storage:', image_url);
               return res.status(500).json({ error: 'Invalid image URL returned from storage.' });
             }
-            
+
             // Use flat structure for chain-of-zoom (confirmed with curl testing)
             falPayload = {
               image_url: image_url,
@@ -1919,7 +1913,7 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_url) {
               return res.status(400).json({ error: 'Missing required field for chain-of-zoom: image_url' });
             }
-            
+
             // Use flat structure (same as playground)
             falPayload = {
               image_url: req.body.image_url,
@@ -1939,29 +1933,29 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_file_base64) {
               return res.status(400).json({ error: 'Missing required field for clarity-upscale playground: image_file_base64' });
             }
-            
+
             // Upload image file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = image_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(image_file_base64);
             if (match) fileData = match[1];
-            
+
             // Convert base64 to buffer
             const buffer = Buffer.from(fileData, 'base64');
-            
+
             // Detect image MIME type or use default
             let mimeType = 'image/png';
             const originalMatch = /^data:(.*?);base64,/.exec(image_file_base64);
             if (originalMatch && originalMatch[1]) {
               mimeType = originalMatch[1];
             }
-            
+
             // Create a Blob with detected MIME type
             const blob = new Blob([buffer], { type: mimeType });
-            
+
             // Use appropriate file extension based on MIME type
             let fileExtension = '.png';
             if (mimeType.includes('jpeg') || mimeType.includes('jpg')) {
@@ -1971,13 +1965,13 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             } else if (mimeType.includes('webp')) {
               fileExtension = '.webp';
             }
-            
+
             // Add file properties to the blob
             Object.defineProperty(blob, 'name', {
               value: `image${fileExtension}`,
               writable: false
             });
-            
+
             // Upload file to Fal storage
             let image_url;
             try {
@@ -1987,13 +1981,13 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
               console.error('Failed to upload image to Fal storage:', uploadError);
               return res.status(500).json({ error: 'Failed to upload image to storage.' });
             }
-            
+
             // Validate that we got a proper URL
             if (!image_url || typeof image_url !== 'string' || !image_url.startsWith('http')) {
               console.error('Invalid image URL returned from Fal storage:', image_url);
               return res.status(500).json({ error: 'Invalid image URL returned from storage.' });
             }
-            
+
             // Use flat structure for clarity-upscaler (confirmed with curl testing)
             falPayload = {
               image_url: image_url
@@ -2004,7 +1998,7 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_url) {
               return res.status(400).json({ error: 'Missing required field for clarity-upscale: image_url' });
             }
-            
+
             // Use flat structure (same as playground)
             falPayload = {
               image_url: req.body.image_url
@@ -2019,29 +2013,29 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_file_base64) {
               return res.status(400).json({ error: 'Missing required field for pasd playground: image_file_base64' });
             }
-            
+
             // Upload image file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = image_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(image_file_base64);
             if (match) fileData = match[1];
-            
+
             // Convert base64 to buffer
             const buffer = Buffer.from(fileData, 'base64');
-            
+
             // Detect image MIME type or use default
             let mimeType = 'image/png';
             const originalMatch = /^data:(.*?);base64,/.exec(image_file_base64);
             if (originalMatch && originalMatch[1]) {
               mimeType = originalMatch[1];
             }
-            
+
             // Create a Blob with detected MIME type
             const blob = new Blob([buffer], { type: mimeType });
-            
+
             // Use appropriate file extension based on MIME type
             let fileExtension = '.png';
             if (mimeType.includes('jpeg') || mimeType.includes('jpg')) {
@@ -2051,13 +2045,13 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             } else if (mimeType.includes('webp')) {
               fileExtension = '.webp';
             }
-            
+
             // Add file properties to the blob
             Object.defineProperty(blob, 'name', {
               value: `image${fileExtension}`,
               writable: false
             });
-            
+
             // Upload file to Fal storage
             let image_url;
             try {
@@ -2067,13 +2061,13 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
               console.error('Failed to upload image to Fal storage:', uploadError);
               return res.status(500).json({ error: 'Failed to upload image to storage.' });
             }
-            
+
             // Validate that we got a proper URL
             if (!image_url || typeof image_url !== 'string' || !image_url.startsWith('http')) {
               console.error('Invalid image URL returned from Fal storage:', image_url);
               return res.status(500).json({ error: 'Invalid image URL returned from storage.' });
             }
-            
+
             // Use flat structure for pasd (confirmed with curl testing)
             falPayload = {
               image_url: image_url,
@@ -2090,7 +2084,7 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_url) {
               return res.status(400).json({ error: 'Missing required field for pasd: image_url' });
             }
-            
+
             // Use flat structure (same as playground)
             falPayload = {
               image_url: req.body.image_url,
@@ -2114,21 +2108,21 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!prompt || prompt.trim() === '') {
               return res.status(400).json({ error: 'Missing required field for object-removal playground: prompt (describe what to remove)' });
             }
-            
+
             // Upload image file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = image_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(image_file_base64);
             if (match) {
               fileData = match[1];
             }
-            
+
             const imageBuffer = Buffer.from(fileData, 'base64');
             const image_url = await fal.storage.upload(imageBuffer);
-            
+
             // Use flat structure for object-removal (confirmed with curl testing)
             falPayload = {
               image_url: image_url,
@@ -2154,21 +2148,21 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_file_base64) {
               return res.status(400).json({ error: 'Missing required field for recraft/vectorize playground: image_file_base64' });
             }
-            
+
             // Upload image file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = image_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(image_file_base64);
             if (match) {
               fileData = match[1];
             }
-            
+
             const imageBuffer = Buffer.from(fileData, 'base64');
             const image_url = await fal.storage.upload(imageBuffer);
-            
+
             // Use flat structure for recraft/vectorize
             // Hardcode parameters for playground mode
             falPayload = {
@@ -2188,21 +2182,21 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_file_base64) {
               return res.status(400).json({ error: 'Missing required field for image-editing/cartoonify playground: image_file_base64' });
             }
-            
+
             // Upload image file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = image_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(image_file_base64);
             if (match) {
               fileData = match[1];
             }
-            
+
             const imageBuffer = Buffer.from(fileData, 'base64');
             const image_url = await fal.storage.upload(imageBuffer);
-            
+
             // Use flat structure for image-editing/cartoonify
             // Hardcode parameters for playground mode
             falPayload = {
@@ -2229,21 +2223,21 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!prompt || prompt.trim() === '') {
               return res.status(400).json({ error: 'Missing required field for hidream-e1-full playground: prompt (edit instruction)' });
             }
-            
+
             // Upload image file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = image_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(image_file_base64);
             if (match) {
               fileData = match[1];
             }
-            
+
             const imageBuffer = Buffer.from(fileData, 'base64');
             const image_url = await fal.storage.upload(imageBuffer);
-            
+
             // Use flat structure for hidream-e1-full
             // Hardcode parameters for playground mode
             falPayload = {
@@ -2277,21 +2271,21 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!openai_api_key || openai_api_key.trim() === '') {
               return res.status(400).json({ error: 'Missing required field for gpt-image-1/edit-image/byok playground: openai_api_key (OpenAI API key required)' });
             }
-            
+
             // Upload image file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = image_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(image_file_base64);
             if (match) {
               fileData = match[1];
             }
-            
+
             const imageBuffer = Buffer.from(fileData, 'base64');
             const image_url = await fal.storage.upload(imageBuffer);
-            
+
             // Use flat structure for gpt-image-1/edit-image/byok
             // Hardcode parameters for playground mode
             falPayload = {
@@ -2316,21 +2310,21 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_file_base64) {
               return res.status(400).json({ error: 'Missing required field for plushify playground: image_file_base64' });
             }
-            
+
             // Upload image file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = image_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(image_file_base64);
             if (match) {
               fileData = match[1];
             }
-            
+
             const imageBuffer = Buffer.from(fileData, 'base64');
             const image_url = await fal.storage.upload(imageBuffer);
-            
+
             // Use flat structure for plushify
             // Hardcode parameters for playground mode
             falPayload = {
@@ -2356,21 +2350,21 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_file_base64) {
               return res.status(400).json({ error: 'Missing required field for ghiblify playground: image_file_base64' });
             }
-            
+
             // Upload image file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = image_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(image_file_base64);
             if (match) {
               fileData = match[1];
             }
-            
+
             const imageBuffer = Buffer.from(fileData, 'base64');
             const image_url = await fal.storage.upload(imageBuffer);
-            
+
             // Use flat structure for ghiblify
             // Hardcode parameters for playground mode
             falPayload = {
@@ -2391,21 +2385,21 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_file_base64 || !prompt) {
               return res.status(400).json({ error: 'Missing required fields for gemini-flash-edit playground: image_file_base64 and prompt' });
             }
-            
+
             // Upload image file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = image_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(image_file_base64);
             if (match) {
               fileData = match[1];
             }
-            
+
             const imageBuffer = Buffer.from(fileData, 'base64');
             const image_url = await fal.storage.upload(imageBuffer);
-            
+
             // Use flat structure for gemini-flash-edit
             falPayload = {
               prompt: prompt,
@@ -2425,21 +2419,21 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_file_base64) {
               return res.status(400).json({ error: 'Missing required field for invisible-watermark playground: image_file_base64' });
             }
-            
+
             // Upload image file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = image_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(image_file_base64);
             if (match) {
               fileData = match[1];
             }
-            
+
             const imageBuffer = Buffer.from(fileData, 'base64');
             const image_url = await fal.storage.upload(imageBuffer);
-            
+
             // Use flat structure for invisible-watermark
             // Hardcode parameters for playground mode (encode watermark)
             falPayload = {
@@ -2461,21 +2455,21 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_file_base64) {
               return res.status(400).json({ error: 'Missing required field for ddcolor playground: image_file_base64' });
             }
-            
+
             // Upload image file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = image_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(image_file_base64);
             if (match) {
               fileData = match[1];
             }
-            
+
             const imageBuffer = Buffer.from(fileData, 'base64');
             const image_url = await fal.storage.upload(imageBuffer);
-            
+
             // Use flat structure for ddcolor
             // Hardcode parameters for playground mode
             falPayload = {
@@ -2495,21 +2489,21 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_file_base64) {
               return res.status(400).json({ error: 'Missing required field for codeformer playground: image_file_base64' });
             }
-            
+
             // Upload image file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = image_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(image_file_base64);
             if (match) {
               fileData = match[1];
             }
-            
+
             const imageBuffer = Buffer.from(fileData, 'base64');
             const image_url = await fal.storage.upload(imageBuffer);
-            
+
             // Use flat structure for codeformer
             // Hardcode sensible defaults for playground mode
             falPayload = {
@@ -2534,21 +2528,21 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_file_base64 || !prompt) {
               return res.status(400).json({ error: 'Missing required fields for ltx-video-v095/image-to-video playground: image_file_base64 and prompt' });
             }
-            
+
             // Upload image file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = image_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(image_file_base64);
             if (match) {
               fileData = match[1];
             }
-            
+
             const imageBuffer = Buffer.from(fileData, 'base64');
             const image_url = await fal.storage.upload(imageBuffer);
-            
+
             // Use flat structure for ltx-video-v095/image-to-video
             // Hardcode sensible defaults for playground mode
             falPayload = {
@@ -2574,21 +2568,21 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_file_base64 || !prompt) {
               return res.status(400).json({ error: 'Missing required fields for kling-video/v2/master/image-to-video playground: image_file_base64 and prompt' });
             }
-            
+
             // Upload image file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = image_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(image_file_base64);
             if (match) {
               fileData = match[1];
             }
-            
+
             const imageBuffer = Buffer.from(fileData, 'base64');
             const image_url = await fal.storage.upload(imageBuffer);
-            
+
             // Use flat structure for kling-video/v2/master/image-to-video
             // Hardcode sensible defaults for playground mode
             falPayload = {
@@ -2612,21 +2606,21 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_file_base64 || !prompt) {
               return res.status(400).json({ error: 'Missing required fields for wan-effects playground: image_file_base64 and prompt' });
             }
-            
+
             // Upload image file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = image_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(image_file_base64);
             if (match) {
               fileData = match[1];
             }
-            
+
             const imageBuffer = Buffer.from(fileData, 'base64');
             const image_url = await fal.storage.upload(imageBuffer);
-            
+
             // Use flat structure for wan-effects
             // Hardcode sensible defaults for playground mode
             falPayload = {
@@ -2654,21 +2648,21 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_file_base64 || !prompt) {
               return res.status(400).json({ error: 'Missing required fields for veo2/image-to-video playground: image_file_base64 and prompt' });
             }
-            
+
             // Upload image file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = image_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(image_file_base64);
             if (match) {
               fileData = match[1];
             }
-            
+
             const imageBuffer = Buffer.from(fileData, 'base64');
             const image_url = await fal.storage.upload(imageBuffer);
-            
+
             // Use flat structure for veo2/image-to-video
             // Hardcode sensible defaults for playground mode
             falPayload = {
@@ -2691,21 +2685,21 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_file_base64 || !prompt) {
               return res.status(400).json({ error: 'Missing required fields for kling-video/v1.6/pro/image-to-video playground: image_file_base64 and prompt' });
             }
-            
+
             // Upload image file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = image_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(image_file_base64);
             if (match) {
               fileData = match[1];
             }
-            
+
             const imageBuffer = Buffer.from(fileData, 'base64');
             const image_url = await fal.storage.upload(imageBuffer);
-            
+
             // Use flat structure for kling-video/v1.6/pro/image-to-video
             // Hardcode sensible defaults for playground mode
             falPayload = {
@@ -2730,21 +2724,21 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_file_base64 || !prompt) {
               return res.status(400).json({ error: 'Missing required fields for minimax/video-01/image-to-video playground: image_file_base64 and prompt' });
             }
-            
+
             // Upload image file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = image_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(image_file_base64);
             if (match) {
               fileData = match[1];
             }
-            
+
             const imageBuffer = Buffer.from(fileData, 'base64');
             const image_url = await fal.storage.upload(imageBuffer);
-            
+
             // Use flat structure for minimax/video-01/image-to-video
             // Hardcode sensible defaults for playground mode
             falPayload = {
@@ -2766,21 +2760,21 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_file_base64 || !prompt) {
               return res.status(400).json({ error: 'Missing required fields for bytedance/seedance/v1/lite/image-to-video playground: image_file_base64 and prompt' });
             }
-            
+
             // Upload image file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = image_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(image_file_base64);
             if (match) {
               fileData = match[1];
             }
-            
+
             const imageBuffer = Buffer.from(fileData, 'base64');
             const image_url = await fal.storage.upload(imageBuffer);
-            
+
             // Use flat structure for bytedance/seedance/v1/lite/image-to-video
             // Hardcode sensible defaults for playground mode
             falPayload = {
@@ -2805,11 +2799,11 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!audio_file_base64 || !image_file_base64) {
               return res.status(400).json({ error: 'Missing required fields for hunyuan-avatar playground: audio_file_base64 and image_file_base64' });
             }
-            
+
             // Upload both files using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Upload audio file
             let audioFileData = audio_file_base64;
             const audioMatch = /^data:.*;base64,(.*)$/.exec(audio_file_base64);
@@ -2818,7 +2812,7 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             }
             const audioBuffer = Buffer.from(audioFileData, 'base64');
             const audio_url = await fal.storage.upload(audioBuffer);
-            
+
             // Upload image file
             let imageFileData = image_file_base64;
             const imageMatch = /^data:.*;base64,(.*)$/.exec(image_file_base64);
@@ -2827,7 +2821,7 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             }
             const imageBuffer = Buffer.from(imageFileData, 'base64');
             const image_url = await fal.storage.upload(imageBuffer);
-            
+
             // Use flat structure for hunyuan-avatar
             // Hardcode sensible defaults for playground mode
             falPayload = {
@@ -2852,21 +2846,21 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_file_base64 || !prompt) {
               return res.status(400).json({ error: 'Missing required fields for ltx-video-13b-dev/image-to-video playground: image_file_base64 and prompt' });
             }
-            
+
             // Upload image file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = image_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(image_file_base64);
             if (match) {
               fileData = match[1];
             }
-            
+
             const imageBuffer = Buffer.from(fileData, 'base64');
             const image_url = await fal.storage.upload(imageBuffer);
-            
+
             // Use flat structure for ltx-video-13b-dev/image-to-video
             // Hardcode sensible defaults for playground mode
             falPayload = {
@@ -2901,11 +2895,11 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!first_image_file_base64 || !last_image_file_base64 || !prompt) {
               return res.status(400).json({ error: 'Missing required fields for pixverse/v4.5/transition playground: first_image_file_base64, last_image_file_base64, and prompt' });
             }
-            
+
             // Upload both image files using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Upload first image file
             let firstFileData = first_image_file_base64;
             const firstMatch = /^data:.*;base64,(.*)$/.exec(first_image_file_base64);
@@ -2914,7 +2908,7 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             }
             const firstImageBuffer = Buffer.from(firstFileData, 'base64');
             const first_image_url = await fal.storage.upload(firstImageBuffer);
-            
+
             // Upload last image file
             let lastFileData = last_image_file_base64;
             const lastMatch = /^data:.*;base64,(.*)$/.exec(last_image_file_base64);
@@ -2923,7 +2917,7 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             }
             const lastImageBuffer = Buffer.from(lastFileData, 'base64');
             const last_image_url = await fal.storage.upload(lastImageBuffer);
-            
+
             // Use flat structure for pixverse/v4.5/transition
             // Hardcode sensible defaults for playground mode
             falPayload = {
@@ -2950,21 +2944,21 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_file_base64 || !prompt) {
               return res.status(400).json({ error: 'Missing required fields for pika/v2/turbo/image-to-video playground: image_file_base64 and prompt' });
             }
-            
+
             // Upload image file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = image_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(image_file_base64);
             if (match) {
               fileData = match[1];
             }
-            
+
             const imageBuffer = Buffer.from(fileData, 'base64');
             const image_url = await fal.storage.upload(imageBuffer);
-            
+
             // Use flat structure for pika/v2/turbo/image-to-video
             // Hardcode sensible defaults for playground mode
             falPayload = {
@@ -2989,11 +2983,11 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_files_base64 || !Array.isArray(image_files_base64) || image_files_base64.length === 0 || !prompt) {
               return res.status(400).json({ error: 'Missing required fields for pika/v2.2/pikascenes playground: image_files_base64 (array) and prompt' });
             }
-            
+
             // Upload all image files using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             const imageUrls = [];
             for (const imageBase64 of image_files_base64) {
               // Strip data URI prefix if present
@@ -3002,12 +2996,12 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
               if (match) {
                 fileData = match[1];
               }
-              
+
               const imageBuffer = Buffer.from(fileData, 'base64');
               const image_url = await fal.storage.upload(imageBuffer);
               imageUrls.push({ image_url: image_url });
             }
-            
+
             // Use flat structure for pika/v2.2/pikascenes
             // Hardcode sensible defaults for playground mode
             falPayload = {
@@ -3034,21 +3028,21 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_file_base64 || !prompt) {
               return res.status(400).json({ error: 'Missing required fields for pika/v2.1/image-to-video playground: image_file_base64 and prompt' });
             }
-            
+
             // Upload image file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = image_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(image_file_base64);
             if (match) {
               fileData = match[1];
             }
-            
+
             const imageBuffer = Buffer.from(fileData, 'base64');
             const image_url = await fal.storage.upload(imageBuffer);
-            
+
             // Use flat structure for pika/v2.1/image-to-video
             // Hardcode sensible defaults for playground mode
             falPayload = {
@@ -3073,21 +3067,21 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_file_base64 || !prompt) {
               return res.status(400).json({ error: 'Missing required fields for hunyuan-video-image-to-video playground: image_file_base64 and prompt' });
             }
-            
+
             // Upload image file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = image_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(image_file_base64);
             if (match) {
               fileData = match[1];
             }
-            
+
             const imageBuffer = Buffer.from(fileData, 'base64');
             const image_url = await fal.storage.upload(imageBuffer);
-            
+
             // Use flat structure for hunyuan-video-image-to-video
             // Hardcode sensible defaults for playground mode
             falPayload = {
@@ -3113,21 +3107,21 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_file_base64 || !prompt) {
               return res.status(400).json({ error: 'Missing required fields for hunyuan-video-img2vid-lora playground: image_file_base64 and prompt' });
             }
-            
+
             // Upload image file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = image_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(image_file_base64);
             if (match) {
               fileData = match[1];
             }
-            
+
             const imageBuffer = Buffer.from(fileData, 'base64');
             const image_url = await fal.storage.upload(imageBuffer);
-            
+
             // Use flat structure for hunyuan-video-img2vid-lora
             // Hardcode sensible defaults for playground mode
             falPayload = {
@@ -3149,21 +3143,21 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!audio_file_base64) {
               return res.status(400).json({ error: 'Missing required field for smart-turn playground: audio_file_base64' });
             }
-            
+
             // Upload audio file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = audio_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(audio_file_base64);
             if (match) {
               fileData = match[1];
             }
-            
+
             const audioBuffer = Buffer.from(fileData, 'base64');
             const audio_url = await fal.storage.upload(audioBuffer);
-            
+
             // Use flat structure for smart-turn
             falPayload = {
               audio_url: audio_url
@@ -3186,21 +3180,21 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!audio_file_base64) {
               return res.status(400).json({ error: 'Missing required field for speech-to-text/turbo playground: audio_file_base64' });
             }
-            
+
             // Upload audio file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = audio_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(audio_file_base64);
             if (match) {
               fileData = match[1];
             }
-            
+
             const audioBuffer = Buffer.from(fileData, 'base64');
             const audio_url = await fal.storage.upload(audioBuffer);
-            
+
             // Use flat structure for speech-to-text/turbo
             // Default to use punctuation & capitalization
             falPayload = {
@@ -3226,21 +3220,21 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!audio_file_base64) {
               return res.status(400).json({ error: 'Missing required field for speech-to-text/turbo/stream playground: audio_file_base64' });
             }
-            
+
             // Upload audio file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = audio_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(audio_file_base64);
             if (match) {
               fileData = match[1];
             }
-            
+
             const audioBuffer = Buffer.from(fileData, 'base64');
             const audio_url = await fal.storage.upload(audioBuffer);
-            
+
             // Use flat structure for speech-to-text/turbo/stream
             // Default to use punctuation & capitalization
             falPayload = {
@@ -3266,21 +3260,21 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!audio_file_base64) {
               return res.status(400).json({ error: 'Missing required field for elevenlabs/speech-to-text playground: audio_file_base64' });
             }
-            
+
             // Upload audio file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = audio_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(audio_file_base64);
             if (match) {
               fileData = match[1];
             }
-            
+
             const audioBuffer = Buffer.from(fileData, 'base64');
             const audio_url = await fal.storage.upload(audioBuffer);
-            
+
             // Use flat structure for elevenlabs/speech-to-text
             // Default to enable audio events tagging and speaker diarization
             falPayload = {
@@ -3310,21 +3304,21 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!audio_file_base64) {
               return res.status(400).json({ error: 'Missing required field for wizper playground: audio_file_base64' });
             }
-            
+
             // Upload audio file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = audio_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(audio_file_base64);
             if (match) {
               fileData = match[1];
             }
-            
+
             const audioBuffer = Buffer.from(fileData, 'base64');
             const audio_url = await fal.storage.upload(audioBuffer);
-            
+
             // Use flat structure for wizper
             // Default to transcribe task, English language, segment chunks, version 3
             falPayload = {
@@ -3356,21 +3350,21 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!audio_file_base64) {
               return res.status(400).json({ error: 'Missing required field for whisper playground: audio_file_base64' });
             }
-            
+
             // Upload audio file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = audio_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(audio_file_base64);
             if (match) {
               fileData = match[1];
             }
-            
+
             const audioBuffer = Buffer.from(fileData, 'base64');
             const audio_url = await fal.storage.upload(audioBuffer);
-            
+
             // Use flat structure for whisper with sensible defaults
             falPayload = {
               audio_url: audio_url,
@@ -3409,21 +3403,21 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!video_file_base64 || !prompt) {
               return res.status(400).json({ error: 'Missing required fields for wan-vace-14b/outpainting playground: video_file_base64, prompt' });
             }
-            
+
             // Upload video file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = video_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(video_file_base64);
             if (match) {
               fileData = match[1];
             }
-            
+
             const videoBuffer = Buffer.from(fileData, 'base64');
             const video_url = await fal.storage.upload(videoBuffer);
-            
+
             // Use flat structure for wan-vace-14b/outpainting with sensible defaults
             falPayload = {
               prompt: prompt,
@@ -3482,11 +3476,11 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!video_file_base64 || !mask_video_file_base64 || !prompt) {
               return res.status(400).json({ error: 'Missing required fields for wan-vace-14b/inpainting playground: video_file_base64, mask_video_file_base64, prompt' });
             }
-            
+
             // Upload both video files using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Upload source video
             let videoFileData = video_file_base64;
             const videoMatch = /^data:.*;base64,(.*)$/.exec(video_file_base64);
@@ -3495,7 +3489,7 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             }
             const videoBuffer = Buffer.from(videoFileData, 'base64');
             const video_url = await fal.storage.upload(videoBuffer);
-            
+
             // Upload mask video
             let maskFileData = mask_video_file_base64;
             const maskMatch = /^data:.*;base64,(.*)$/.exec(mask_video_file_base64);
@@ -3504,7 +3498,7 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             }
             const maskBuffer = Buffer.from(maskFileData, 'base64');
             const mask_video_url = await fal.storage.upload(maskBuffer);
-            
+
             // Use flat structure for wan-vace-14b/inpainting with sensible defaults
             falPayload = {
               prompt: prompt,
@@ -3557,21 +3551,21 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!video_file_base64 || !prompt) {
               return res.status(400).json({ error: 'Missing required fields for ltx-video-13b-distilled/extend playground: video_file_base64, prompt' });
             }
-            
+
             // Upload video file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = video_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(video_file_base64);
             if (match) {
               fileData = match[1];
             }
-            
+
             const videoBuffer = Buffer.from(fileData, 'base64');
             const video_url = await fal.storage.upload(videoBuffer);
-            
+
             // Use flat structure for ltx-video-13b-distilled/extend with sensible defaults
             falPayload = {
               prompt: prompt,
@@ -3634,21 +3628,21 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!video_file_base64 || !prompt) {
               return res.status(400).json({ error: 'Missing required fields for ltx-video-13b-dev/extend playground: video_file_base64, prompt' });
             }
-            
+
             // Upload video file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = video_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(video_file_base64);
             if (match) {
               fileData = match[1];
             }
-            
+
             const videoBuffer = Buffer.from(fileData, 'base64');
             const video_url = await fal.storage.upload(videoBuffer);
-            
+
             // Use flat structure for ltx-video-13b-dev/extend with sensible defaults (different from distilled)
             falPayload = {
               prompt: prompt,
@@ -3711,12 +3705,12 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!video_file_base64) {
               return res.status(400).json({ error: 'Missing required field for ben/v2/video playground: video_file_base64' });
             }
-            
+
             console.log('🎬 [BEN/V2/VIDEO] Starting video processing...');
-            
+
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = video_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(video_file_base64);
@@ -3724,10 +3718,10 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
               fileData = match[1];
               console.log('🎬 [BEN/V2/VIDEO] Stripped data URI prefix');
             }
-            
+
             const videoBuffer = Buffer.from(fileData, 'base64');
             console.log('🎬 [BEN/V2/VIDEO] Video buffer created, size:', videoBuffer.length, 'bytes');
-            
+
             // 🎯 BILLING METADATA (NO LOCAL FFMPEG) — derive from request params or fallback
             let videoMetadata;
             const reqWidth = Number((req.body && req.body.width) || (req.body && req.body.video_width));
@@ -3777,12 +3771,12 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
 
             // Store metadata for downstream billing calculation
             req.body._videoMetadata = videoMetadata;
-            
+
             // Upload video to FAL storage
             console.log('🎬 [BEN/V2/VIDEO] Uploading video to FAL storage...');
             const video_url = await fal.storage.upload(videoBuffer);
             console.log('✅ [BEN/V2/VIDEO] Video uploaded to:', video_url);
-            
+
             // Use flat structure for ben/v2/video (background removal)
             falPayload = {
               video_url: video_url,
@@ -3808,21 +3802,21 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             if (!image_file_base64) {
               return res.status(400).json({ error: 'Missing required field for stable-video playground: image_file_base64' });
             }
-            
+
             // Upload image file using Fal client
             const { fal } = require('@fal-ai/client');
             fal.config({ credentials: FAL_API_KEY });
-            
+
             // Strip data URI prefix if present
             let fileData = image_file_base64;
             const match = /^data:.*;base64,(.*)$/.exec(image_file_base64);
             if (match) {
               fileData = match[1];
             }
-            
+
             const imageBuffer = Buffer.from(fileData, 'base64');
             const image_url = await fal.storage.upload(imageBuffer);
-            
+
             // Use flat structure for stable-video
             // Hardcode sensible defaults for playground mode
             falPayload = {
@@ -3948,9 +3942,9 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
           endpoint = 'fal-ai/ben/v2/video';  // Use ben/v2/video endpoint
         }
 
-        
+
         const finalUrl = `${falBaseUrl}/${endpoint}`;
-        
+
         // CRITICAL FIX: Pre-check balance before making FAL.AI API call
         let wasDeducted = false; // Declare for scope
         if (userEmail) {
@@ -3960,8 +3954,8 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
           } catch (pricingError: any) {
             console.error(`🚨 [PRICING ERROR] ${pricingError.message}`);
             statusCode = 400;
-            return res.status(400).json({ 
-              error: 'PRICING_ERROR', 
+            return res.status(400).json({
+              error: 'PRICING_ERROR',
               message: `Model "${appId}" is not supported or has invalid pricing configuration.`
             });
           }
@@ -3974,14 +3968,14 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             return res.status(402).json({ error: 'Insufficient balance to process this request.' });
           }
         }
-        
+
         // 🎯 START PRECISE TIMING (right before FAL.ai request)
         const falRequestStartTime = Date.now();
         if (req.body._computeEstimate && req.body._computeEstimate.isRealTimeMeasurement) {
           req.body._computeEstimate.actualStartTime = falRequestStartTime;
-  
+
         }
-        
+
         response = await axios.post(
           finalUrl,
           falPayload,
@@ -3992,7 +3986,7 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             }
           }
         );
-        
+
         // 🎯 END PRECISE TIMING (right after complete response received)
         const falRequestEndTime = Date.now();
         if (req.body._computeEstimate && req.body._computeEstimate.isRealTimeMeasurement) {
@@ -4001,7 +3995,7 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
 
           req.body._computeEstimate.measuredProcessingTime = actualProcessingTime;
         }
-        
+
 
         // Handle synchronous responses (models that return results immediately)
         if (response.data && !response.data.request_id) {
@@ -4010,38 +4004,38 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
             // Handle synchronous FAL.AI billing
             if (userEmail) {
               const userId = await getUserIdFromApiKey(apiKey);
-              
+
               let falCostCents: number;
               try {
                 falCostCents = calculateRealFalCost(appId, req.body);
               } catch (pricingError: any) {
                 console.error(`🚨 [PRICING ERROR] ${pricingError.message}`);
-                return res.status(400).json({ 
-                  error: 'PRICING_ERROR', 
+                return res.status(400).json({
+                  error: 'PRICING_ERROR',
                   message: `Model "${appId}" is not supported or has invalid pricing configuration.`
                 });
               }
 
-              
+
               // ⏱️ DYNAMIC BILLING - Calculate & charge based on ACTUAL processing time
-              
+
               if (req.body._computeEstimate && req.body._computeEstimate.isRealTimeMeasurement && req.body._computeEstimate.measuredProcessingTime) {
                 const actualProcessingTime = req.body._computeEstimate.measuredProcessingTime;
                 const data = req.body._computeEstimate;
-                
 
-                
+
+
                 // Calculate actual cost based on measured processing time
                 const actualCostUsd = actualProcessingTime * data.ratePerComputeSecond;
                 const actualCostCents = actualCostUsd * 100; // NO ROUNDING - PRECISE BILLING!
-                
 
 
-                
+
+
                 // 💰 CHARGE THE ACTUAL AMOUNT (no estimation, no adjustment needed!)
                 if (actualCostCents > 0) {
-                  
-                  
+
+
                   try {
                     const { data: deductResult, error: deductError } = await supabase.rpc('deduct_balance_atomic', {
                       user_email: userEmail,
@@ -4054,7 +4048,7 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
                       return res.status(402).json({ error: 'Insufficient balance to process this request.' });
                     }
                     wasDeducted = true;
-                    
+
                     const userIdForCharge = await getUserIdFromApiKey(apiKey);
                     const userClientForCharge = userIdForCharge ? getUserSupabaseClient(userIdForCharge) : null;
                     const { data: balanceData, error: balanceError } = userClientForCharge ? await userClientForCharge
@@ -4062,27 +4056,27 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
                       .select('balance_usd_cents')
                       .eq('id', userIdForCharge)
                       .single() : { data: null, error: 'no-user' } as any;
-                    
+
                     if (!balanceError && balanceData) {
                       const oldBalance = balanceData.balance_usd_cents;
                       const newBalance = oldBalance - actualCostCents;
-                      
+
                       if (userClientForCharge && userIdForCharge) {
                         const { data: updateResult, error: updateError } = await userClientForCharge
                           .rpc('deduct_balance_atomic', {
                             p_user_id: userIdForCharge,
                             p_amount_cents: actualCostCents
                           });
-                        
+
                         if (!updateError && updateResult?.success) {
                           // Balance deducted successfully
                         } else {
                           // Balance deduction failed
                         }
                       }
-                      
 
-                      
+
+
                       // Update falCostCents to reflect the actual charged amount
                       falCostCents = actualCostCents;
                     }
@@ -4093,10 +4087,10 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
                   console.log('💰 [DYNAMIC BILLING] Processing time was minimal - no charge applied');
                   falCostCents = 0;
                 }
-                
+
 
               }
-              
+
               // CRITICAL FIX: Deduct balance for synchronous FAL.AI models (skip if already handled by dynamic billing)
               if (userEmail && !wasDeducted) {
                 const userIdForSync = await getUserIdFromApiKey(apiKey);
@@ -4106,9 +4100,9 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
                   .select('balance_usd_cents')
                   .eq('id', userIdForSync)
                   .single() : { data: null, error: 'no-user' } as any;
-                
-                                  if (userBalance && userBalance.balance_usd_cents >= falCostCents) {
-                  
+
+                if (userBalance && userBalance.balance_usd_cents >= falCostCents) {
+
                   if (userClientForSync && userIdForSync) {
                     // ATOMIC BALANCE UPDATE - NO RACE CONDITION
                     const { data: updateResult, error: updateError } = await userClientForSync
@@ -4116,23 +4110,23 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
                         p_user_id: userIdForSync,
                         p_amount_cents: falCostCents
                       });
-                    
+
                     if (!updateError && updateResult && updateResult.success) {
                       wasDeducted = true;
                     } else {
                       // If atomic update fails, return error to prevent double-spending
-                      return res.status(402).json({ 
+                      return res.status(402).json({
                         error: 'Insufficient balance or balance update failed'
                       });
                     }
                   }
-                                  } else {
-                    return res.status(402).json({ error: 'Insufficient balance to process this request.' });
-                  }
+                } else {
+                  return res.status(402).json({ error: 'Insufficient balance to process this request.' });
+                }
               }
-              
 
-              
+
+
               const logResult = userId ? await getUserSupabaseClient(userId).from('api_logs').insert({
                 user_id: userId,
                 api_key_prefix_used: apiKeyPrefix,
@@ -4155,9 +4149,9 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
                 was_deducted: wasDeducted, // Use actual deduction status
                 timestamp: new Date().toISOString()
               }) : null;
-              
 
-              
+
+
               // Add cost information to the response
               let responseData = response.data;
               responseData._cost_info = {
@@ -4182,13 +4176,13 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
               falCostCents = calculateRealFalCost(appId, req.body); // DYNAMIC PRICING FIX!
             } catch (pricingError: any) {
               console.error(`🚨 [PRICING ERROR] ${pricingError.message}`);
-              return res.status(400).json({ 
-                error: 'PRICING_ERROR', 
+              return res.status(400).json({
+                error: 'PRICING_ERROR',
                 message: `Model "${appId}" is not supported or has invalid pricing configuration.`,
-                details: pricingError.message 
+                details: pricingError.message
               });
             }
-            
+
             // CRITICAL FIX: Pre-check balance for asynchronous FAL.AI models
             if (userEmail && userId) {
               const { data: userBalance } = await getUserSupabaseClient(userId)
@@ -4200,7 +4194,7 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
                 return res.status(402).json({ error: 'Insufficient balance to process this request.' });
               }
             }
-            
+
             await getUserSupabaseClient(userId!).from('api_logs').insert({
               user_id: userId,
               api_key_prefix_used: apiKeyPrefix,
@@ -4219,9 +4213,9 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
               was_deducted: false, // Will be deducted when result is fetched
               timestamp: new Date().toISOString()
             });
-            
+
             // Add cost information to the response
-            let responseData: any = { 
+            let responseData: any = {
               task_id: response.data.request_id,
               _cost_info: {
                 cost_usd: falCostCents / 100,
@@ -4276,14 +4270,14 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
           p_user_id: userId,
           p_amount_cents: actualFinalCostCents
         });
-      
+
       if (!updateError && updateResult && updateResult.success) {
         wasDeducted = true;
         console.log('✅ [ATOMIC] Balance deducted successfully. New balance:', updateResult.new_balance, 'cents');
       } else {
         console.log('❌ [ATOMIC] Balance deduction failed:', updateError?.message);
         // Return error to prevent double-spending
-        return res.status(402).json({ 
+        return res.status(402).json({
           error: 'Insufficient balance or balance update failed'
         });
       }
@@ -4469,14 +4463,14 @@ router.post('/v1/chat/completions', [
             p_user_id: userId,
             p_amount_cents: actualFinalCostCents
           });
-        
+
         if (!updateError && updateResult && updateResult.success) {
           wasDeducted = true;
           console.log('✅ [ATOMIC] Balance deducted successfully. New balance:', updateResult.new_balance, 'cents');
         } else {
           console.log('❌ [ATOMIC] Balance deduction failed:', updateError?.message);
           // Return error to prevent double-spending
-          return res.status(402).json({ 
+          return res.status(402).json({
             error: 'Insufficient balance or balance update failed'
           });
         }
@@ -4677,7 +4671,7 @@ router.get('/v1/completions/result/:task_id', async (req, res) => {
     // Deduct a fixed cost (e.g., $0.01 = 1 cent) for image generation
     let wasDeducted = false;
     let actualCostCents = 0;
-    
+
     // Find the original request log entry using task_id
     const { data: originalLog, error: logError } = await getUserSupabaseClient(userId)
       .from('api_logs')
@@ -4688,7 +4682,7 @@ router.get('/v1/completions/result/:task_id', async (req, res) => {
       .order('timestamp', { ascending: false })
       .limit(1)
       .maybeSingle();
-    
+
     if (originalLog && originalLog.final_cost_usd_cents) {
       actualCostCents = originalLog.final_cost_usd_cents;
       console.log(`[RESULT ENDPOINT] Found log for task_id ${task_id}, cost: $${(actualCostCents / 100).toFixed(6)}`);
@@ -4699,7 +4693,7 @@ router.get('/v1/completions/result/:task_id', async (req, res) => {
             p_user_id: userId,
             p_amount_cents: actualCostCents
           });
-        
+
         if (!updateError && updateResult && updateResult.success) {
           wasDeducted = true;
           console.log('✅ [ATOMIC] Balance deducted successfully. New balance:', updateResult.new_balance, 'cents');
@@ -4711,7 +4705,7 @@ router.get('/v1/completions/result/:task_id', async (req, res) => {
         } else {
           console.log('❌ [ATOMIC] Balance deduction failed:', updateError?.message);
           // Return error to prevent double-spending
-          return res.status(402).json({ 
+          return res.status(402).json({
             error: 'Insufficient balance or balance update failed'
           });
         }
@@ -4822,7 +4816,7 @@ router.get('/usage/monthly-stats', async (req, res) => {
       const spending_usd = txForMonth.reduce((sum, tx) => sum + (tx.amount || 0), 0);
       return { month, api_calls, api_cost_usd, spending_usd };
     });
-    res.json({ 
+    res.json({
       stats,
       debug_info: {
         server_timestamp: new Date().toISOString(),

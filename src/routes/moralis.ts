@@ -7,13 +7,23 @@ import { paymentsDb, supabase } from '../services/paymentDatabase';
 
 const router = Router();
 
-function verifySignature(serializedBody: string, signature: string | undefined, secret: string | undefined): boolean {
-    if (!secret) return true;
+function timingSafeEqual(a: string, b: string): boolean {
+    try {
+        const ab = Buffer.from(a, 'hex');
+        const bb = Buffer.from(b, 'hex');
+        if (ab.length !== bb.length) return false;
+        return crypto.timingSafeEqual(ab, bb);
+    } catch {
+        return false;
+    }
+}
+
+function verifySignatureHmac(rawBody: string, signature: string | undefined, secret: string | undefined): boolean {
+    if (!secret) return false;
     if (!signature) return false;
     try {
-        const hash = ethers.keccak256(ethers.toUtf8Bytes(serializedBody + secret));
-        console.log('hash', hash);
-        return hash.toLowerCase() === String(signature).toLowerCase();
+        const hmac = crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
+        return timingSafeEqual(hmac, String(signature));
     } catch {
         return false;
     }
@@ -37,13 +47,14 @@ router.post('/', async (req: Request, res: Response) => {
             }
         })();
 
-        // Get the signature and secret from the headers & verify it
+        // Require signature and secret
         const signature = req.headers['x-signature'] as string;
         const secret = process.env.MORALIS_WEBHOOK_SECRET;
-
-        const serialized = JSON.stringify(payload || {});
-        if (!verifySignature(serialized, signature, secret)) {
-            return res.status(200).json({ success: true, processed: 0, note: 'invalid_signature' });
+        if (!secret) {
+            return res.status(401).json({ success: false, error: 'Webhook secret not configured' });
+        }
+        if (!verifySignatureHmac(rawBody, signature, secret)) {
+            return res.status(401).json({ success: false, processed: 0, error: 'invalid_signature' });
         }
 
         const chainId =
