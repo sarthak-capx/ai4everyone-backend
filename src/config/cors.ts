@@ -2,7 +2,7 @@ import cors from 'cors';
 
 export function createCorsMiddleware() {
     const allowedOrigins = process.env.NODE_ENV === 'production'
-        ? ['https://ai4everyone.vercel.app']
+        ? ['https://ai4everyone-psi.vercel.app', 'https://www.ai4everyone-psi.vercel.app']
         : ['http://localhost:5173', 'http://localhost:3000', 'http://localhost:4173'];
 
     return cors({
