@@ -50,7 +50,7 @@ router.post('/wallet-login', [
       console.error('Session regeneration failed:', err);
       return next(new AppError(500, 'Session regeneration failed'));
     }
-    
+
     // Log successful session regeneration for security monitoring
     console.log('Session regenerated successfully for authentication attempt:', {
       ip: req.ip,
@@ -58,7 +58,7 @@ router.post('/wallet-login', [
       timestamp: new Date().toISOString(),
       event: 'session_regeneration'
     });
-    
+
     // Continue with authentication logic in the callback
     handleWalletLogin(req, res, next);
   });
@@ -109,7 +109,7 @@ async function handleWalletLogin(req: Request, res: Response, next: NextFunction
         .rpc('upsert_profile_for_wallet', { p_wallet: walletAddress })
         .single();
       if (rpcProfile) profile = rpcProfile;
-    } catch {}
+    } catch { }
 
     // If RPC failed unexpectedly, bail out (safer than service-role fallback)
     if (!profile) {
@@ -145,24 +145,24 @@ async function handleWalletLogin(req: Request, res: Response, next: NextFunction
         // ❌ NO email, NO fingerprint, NO sensitive data in JWT
       },
       jwtPrivateKey,
-      { 
+      {
         expiresIn: '1h',  // Balanced expiration
         algorithm: 'RS256',  // Asymmetric algorithm
         issuer: 'https://api.ai4everyone.com',
         audience: 'ai4everyone-api'
       }
     );
-    
+
     // Audit the login event
     await supabaseAnon.rpc('audit_security_event', {
       p_event_type: 'wallet_login',
       p_user_id: profile.id,
-      p_details: { 
+      p_details: {
         wallet_address: walletAddress,
         login_method: 'wallet_signature'
       }
     });
-    
+
     res.status(200).json({ user: profile, token });
   } catch (err) {
     // More detailed error logging
@@ -192,6 +192,61 @@ router.get('/wallet-config', async (req: Request, res: Response, next: NextFunct
     console.error('Wallet config error:', err);
     next(new AppError(500, 'Failed to get wallet configuration'));
   }
+});
+
+// New: Session bootstrap endpoint to restore user without wallet signature
+router.get('/session', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const ctx = getUserContext(req);
+    if (!ctx) {
+      return res.status(401).json({ error: 'No active session' });
+    }
+
+    if (!jwtPrivateKey) {
+      return next(new AppError(500, 'JWT private key is not configured'));
+    }
+
+    const token = jwt.sign(
+      {
+        sub: ctx.userId,
+        iat: Math.floor(Date.now() / 1000),
+        jti: uuidv4(),
+        type: 'access'
+      },
+      jwtPrivateKey,
+      {
+        expiresIn: '1h',
+        algorithm: 'RS256',
+        issuer: 'https://api.ai4everyone.com',
+        audience: 'ai4everyone-api'
+      }
+    );
+
+    // Return minimal user object; avoid leaking sensitive data
+    const user = { id: ctx.userId, email: ctx.email, name: null };
+    res.status(200).json({ user, token });
+  } catch (err) {
+    console.error('Session restore error:', err);
+    next(new AppError(500, 'Failed to restore session'));
+  }
+});
+
+// Logout endpoint to clear session
+router.delete('/session', requireUserContext, (req: Request, res: Response, next: NextFunction) => {
+  req.session.destroy((err) => {
+    if (err) {
+      console.error('Session destroy error:', err);
+      return next(new AppError(500, 'Failed to destroy session'));
+    }
+    // Regenerate session ID for security
+    req.session.regenerate((err) => {
+      if (err) {
+        console.error('Session regeneration failed after destroy:', err);
+        return res.status(500).json({ error: 'Session cleanup failed' });
+      }
+      res.status(200).json({ message: 'Logged out successfully' });
+    });
+  });
 });
 
 export default router; 

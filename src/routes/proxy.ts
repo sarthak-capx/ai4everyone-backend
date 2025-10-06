@@ -1,12 +1,10 @@
 import express, { Request, Response } from 'express';
 import axios, { AxiosError } from 'axios';
-import { supabase, supabaseAnon, getUserSupabaseClient } from '../index';
+import { supabase, supabaseAnon, getUserSupabaseClient, jwtPublicKey } from '../index';
 import { body, validationResult } from 'express-validator';
 import { AppError } from '../index';
 import fileType from 'file-type';
-import crypto from 'crypto';
-
-import { v4 as uuidv4 } from 'uuid';
+import jwt from 'jsonwebtoken';
 
 const router = express.Router();
 
@@ -47,7 +45,53 @@ export async function getUserIdFromApiKey(apiKey: string): Promise<string | null
   }
 }
 
+// Helper: get userId from API key OR JWT 
+async function getUserIdFromAuthHeader(authorizationHeader?: string): Promise<{ userId: string | null, userEmail?: string | null, apiKey?: string | null }> {
+  if (!authorizationHeader) return { userId: null };
+  const token = authorizationHeader.split(' ')[1];
+  if (!token) return { userId: null };
 
+  // Try API key path first (fast path for existing clients)
+  const viaApiKey = await getUserIdFromApiKey(token);
+  if (viaApiKey) {
+    try {
+      const userClient = getUserSupabaseClient(viaApiKey);
+      const { data: prof } = await userClient
+        .from('profiles')
+        .select('email')
+        .eq('id', viaApiKey)
+        .single();
+      return { userId: viaApiKey, userEmail: prof?.email || null, apiKey: token };
+    } catch {
+      return { userId: viaApiKey, userEmail: null, apiKey: token };
+    }
+  }
+
+  // Fallback: treat token as JWT and verify
+  try {
+    if (!jwtPublicKey) return { userId: null };
+    const decoded: any = jwt.verify(token, jwtPublicKey, {
+      algorithms: ['RS256'],
+      issuer: 'https://api.ai4everyone.com',
+      audience: 'ai4everyone-api'
+    });
+    const userId = decoded?.sub || null;
+    if (!userId) return { userId: null };
+    try {
+      const userClient = getUserSupabaseClient(userId);
+      const { data: prof } = await userClient
+        .from('profiles')
+        .select('email')
+        .eq('id', userId)
+        .single();
+      return { userId, userEmail: prof?.email || null, apiKey: null };
+    } catch {
+      return { userId, userEmail: null, apiKey: null };
+    }
+  } catch {
+    return { userId: null };
+  }
+}
 
 const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
 
@@ -261,11 +305,13 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
       appId === 'ben/v2/video' ||
       appId === 'fal-ai/ben/v2/video'
     );
-  if (!isSpecialPlayground && (provider !== 'capx_ivmodels' || (appId && !['ace-step', 'fal-ai/ace-step'].includes(appId)))) {
+
+  // For text models only, validate input; image/video models (capx_ivmodels) don't use max_tokens
+  if (provider !== 'capx_ivmodels') {
     if (!req.body.prompt || typeof req.body.prompt !== 'string') {
       return res.status(400).json({ error: 'Prompt is required' });
     }
-    if (!req.body.max_tokens || typeof req.body.max_tokens !== 'number' || req.body.max_tokens < 1) {
+    if (req.body.max_tokens !== undefined && (typeof req.body.max_tokens !== 'number' || req.body.max_tokens < 1)) {
       return res.status(400).json({ error: 'max_tokens must be a positive integer' });
     }
   }
@@ -278,27 +324,23 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
   let wasDeducted = false;
   let response: any;
   try {
-    // Get API key from request header
-    const apiKey = req.headers['authorization']?.split(' ')[1];
+    // Get user from Authorization header: support API key or JWT
+    const authHeader = req.headers['authorization'] as string | undefined;
+    const auth = await getUserIdFromAuthHeader(authHeader);
+    const apiKey = auth.apiKey || null;
     const apiKeyPrefix = apiKey ? apiKey.slice(0, 12) : null;
-    if (!apiKey) {
+    if (!auth.userId) {
       statusCode = 401;
-      return res.status(401).json({ error: 'API key is required' });
-    }
-    // Validate the user's API key
-    const isValid = await validateApiKey(apiKey);
-    if (!isValid) {
-      statusCode = 401;
-      return res.status(401).json({ error: 'Invalid API key' });
+      return res.status(401).json({ error: 'Unauthorized' });
     }
     // --- RATE LIMITING: 60 requests per minute per user ---
     const now = new Date();
     now.setSeconds(0, 0);
     const windowStart = now.toISOString();
-    // Resolve user_id first
-    const userId = await getUserIdFromApiKey(apiKey);
-    let userEmail: string | undefined;
-    if (userId) {
+    // We have userId from either API key or JWT
+    const userId = auth.userId;
+    let userEmail: string | undefined = auth.userEmail || undefined;
+    if (!userEmail) {
       const userClient = getUserSupabaseClient(userId);
       const { data: prof } = await userClient
         .from('profiles')
@@ -4003,7 +4045,7 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
           if (response.data.images || response.data.audio || response.data.video || response.data.videos || response.data.text || response.data.model || response.data.mesh || response.data.model_mesh || response.data.model_url || response.data.glb || response.data.obj) {
             // Handle synchronous FAL.AI billing
             if (userEmail) {
-              const userId = await getUserIdFromApiKey(apiKey);
+              const userId = auth.userId as string;
 
               let falCostCents: number;
               try {
@@ -4049,7 +4091,7 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
                     }
                     wasDeducted = true;
 
-                    const userIdForCharge = await getUserIdFromApiKey(apiKey);
+                    const userIdForCharge = auth.userId as string;
                     const userClientForCharge = userIdForCharge ? getUserSupabaseClient(userIdForCharge) : null;
                     const { data: balanceData, error: balanceError } = userClientForCharge ? await userClientForCharge
                       .from('profiles')
@@ -4093,7 +4135,7 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
 
               // CRITICAL FIX: Deduct balance for synchronous FAL.AI models (skip if already handled by dynamic billing)
               if (userEmail && !wasDeducted) {
-                const userIdForSync = await getUserIdFromApiKey(apiKey);
+                const userIdForSync = auth.userId as string;
                 const userClientForSync = userIdForSync ? getUserSupabaseClient(userIdForSync) : null;
                 const { data: userBalance, error: balanceError } = userClientForSync ? await userClientForSync
                   .from('profiles')
@@ -4170,7 +4212,7 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
         if (response.data && response.data.request_id) {
           // LOG THE FAL.AI REQUEST BEFORE RETURNING (CRITICAL FIX!)
           if (userEmail) {
-            const userId = await getUserIdFromApiKey(apiKey);
+            const userId = auth.userId as string;
             let falCostCents: number;
             try {
               falCostCents = calculateRealFalCost(appId, req.body); // DYNAMIC PRICING FIX!
@@ -4283,9 +4325,8 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
       }
     }
     // Log the API call in our database (after deduction attempt)
-    if (userEmail) {
-      const userId = await getUserIdFromApiKey(apiKey);
-      await getUserSupabaseClient(userId!).from('api_logs').insert({
+    if (userEmail && userId) {
+      await getUserSupabaseClient(userId).from('api_logs').insert({
         user_id: userId,
         api_key_prefix_used: apiKeyPrefix,
         endpoint_called: '/v1/completions',
@@ -4323,10 +4364,10 @@ router.post('/v1/completions', async (req: Request, res: Response) => {
       statusCode = error.response?.status || 500;
       // Log error API call
       if (error.config && error.config.headers && typeof error.config.headers['Authorization'] === 'string') {
-        const authHeader = error.config.headers['Authorization'] as string;
-        const apiKey = authHeader.split(' ')[1];
-        const apiKeyPrefix = apiKey ? apiKey.slice(0, 12) : null;
-        const userId = await getUserIdFromApiKey(apiKey);
+        const authHeaderRaw = error.config.headers['Authorization'] as string;
+        const auth = await getUserIdFromAuthHeader(authHeaderRaw);
+        const apiKeyPrefix = auth.apiKey ? auth.apiKey.slice(0, 12) : null;
+        const userId = auth.userId as string | undefined;
         if (userId) {
           await getUserSupabaseClient(userId).from('api_logs').insert({
             user_id: userId,
@@ -4364,27 +4405,23 @@ router.post('/v1/chat/completions', [
   let wasDeducted = false;
   let response: any;
   try {
-    // Get API key from request header
-    const apiKey = req.headers['authorization']?.split(' ')[1];
+    // Get user from Authorization header: support API key or JWT
+    const authHeader = req.headers['authorization'] as string | undefined;
+    const auth = await getUserIdFromAuthHeader(authHeader);
+    const apiKey = auth.apiKey || null;
     const apiKeyPrefix = apiKey ? apiKey.slice(0, 12) : null;
-    if (!apiKey) {
+    if (!auth.userId) {
       statusCode = 401;
-      return res.status(401).json({ error: 'API key is required' });
-    }
-    // Validate the user's API key
-    const isValid = await validateApiKey(apiKey);
-    if (!isValid) {
-      statusCode = 401;
-      return res.status(401).json({ error: 'Invalid API key' });
+      return res.status(401).json({ error: 'Unauthorized' });
     }
     // --- RATE LIMITING: 60 requests per minute per user ---
     const now = new Date();
     now.setSeconds(0, 0);
     const windowStart = now.toISOString();
-    // Resolve user_id first then fetch email via user-scoped client
-    const userId = await getUserIdFromApiKey(apiKey);
-    let userEmail: string | undefined;
-    if (userId) {
+    // Resolve user id from auth
+    const userId = auth.userId;
+    let userEmail: string | undefined = auth.userEmail || undefined;
+    if (!userEmail) {
       const userClient = getUserSupabaseClient(userId);
       const { data: prof } = await userClient
         .from('profiles')
@@ -4455,49 +4492,44 @@ router.post('/v1/chat/completions', [
     let actualFinalCostUsd = actualBaseCostUsd * (1 + markup_percentage / 100);
     let actualFinalCostCents = actualFinalCostUsd * 100;
     // ATOMIC BALANCE DEDUCTION - NO RACE CONDITION
-    if (userEmail) {
-      const userId = await getUserIdFromApiKey(apiKey);
-      if (userId) {
-        const { data: updateResult, error: updateError } = await getUserSupabaseClient(userId)
-          .rpc('deduct_balance_atomic', {
-            p_user_id: userId,
-            p_amount_cents: actualFinalCostCents
-          });
+    if (userEmail && userId) {
+      const { data: updateResult, error: updateError } = await getUserSupabaseClient(userId)
+        .rpc('deduct_balance_atomic', {
+          p_user_id: userId,
+          p_amount_cents: actualFinalCostCents
+        });
 
-        if (!updateError && updateResult && updateResult.success) {
-          wasDeducted = true;
-          console.log('✅ [ATOMIC] Balance deducted successfully. New balance:', updateResult.new_balance, 'cents');
-        } else {
-          console.log('❌ [ATOMIC] Balance deduction failed:', updateError?.message);
-          // Return error to prevent double-spending
-          return res.status(402).json({
-            error: 'Insufficient balance or balance update failed'
-          });
-        }
-      }
-    }
-    // Log the API call in our database (after deduction attempt)
-    if (userEmail) {
-      const userId = await getUserIdFromApiKey(apiKey);
-      if (userId) {
-        await getUserSupabaseClient(userId).from('api_logs').insert({
-          user_id: userId,
-          api_key_prefix_used: apiKeyPrefix,
-          endpoint_called: '/v1/chat/completions',
-          inference_usage_json: {
-            prompt_tokens: actualPromptTokens,
-            completion_tokens: actualCompletionTokens,
-            total_tokens: actualTotalTokens
-          },
-          inference_cost_usd: actualBaseCostUsd,
-          markup_percentage,
-          final_cost_usd_cents: actualFinalCostCents,
-          status_code_returned: statusCode,
-          was_deducted: wasDeducted,
-          timestamp: new Date().toISOString()
+      if (!updateError && updateResult && updateResult.success) {
+        wasDeducted = true;
+        console.log('✅ [ATOMIC] Balance deducted successfully. New balance:', updateResult.new_balance, 'cents');
+      } else {
+        console.log('❌ [ATOMIC] Balance deduction failed:', updateError?.message);
+        // Return error to prevent double-spending
+        return res.status(402).json({
+          error: 'Insufficient balance or balance update failed'
         });
       }
     }
+    // Log the API call in our database (after deduction attempt)
+    if (userEmail && userId) {
+      await getUserSupabaseClient(userId).from('api_logs').insert({
+        user_id: userId,
+        api_key_prefix_used: apiKeyPrefix,
+        endpoint_called: '/v1/chat/completions',
+        inference_usage_json: {
+          prompt_tokens: actualPromptTokens,
+          completion_tokens: actualCompletionTokens,
+          total_tokens: actualTotalTokens
+        },
+        inference_cost_usd: actualBaseCostUsd,
+        markup_percentage,
+        final_cost_usd_cents: actualFinalCostCents,
+        status_code_returned: statusCode,
+        was_deducted: wasDeducted,
+        timestamp: new Date().toISOString()
+      });
+    }
+
     // Return the response with cost information
     let responseData: any = response.data;
     if (userEmail && usage) {
@@ -4519,10 +4551,10 @@ router.post('/v1/chat/completions', [
       statusCode = error.response?.status || 500;
       // Log error API call
       if (error.config && error.config.headers && typeof error.config.headers['Authorization'] === 'string') {
-        const authHeader = error.config.headers['Authorization'] as string;
-        const apiKey = authHeader.split(' ')[1];
-        const apiKeyPrefix = apiKey ? apiKey.slice(0, 12) : null;
-        const userId = await getUserIdFromApiKey(apiKey);
+        const authHeaderRaw = error.config.headers['Authorization'] as string;
+        const auth = await getUserIdFromAuthHeader(authHeaderRaw);
+        const apiKeyPrefix = auth.apiKey ? auth.apiKey.slice(0, 12) : null;
+        const userId = auth.userId as string | undefined;
         if (userId) {
           await getUserSupabaseClient(userId).from('api_logs').insert({
             user_id: userId,
@@ -4625,22 +4657,19 @@ router.get('/v1/completions/result/:task_id', async (req, res) => {
   const { appId } = req.query;
   if (!task_id) return res.status(400).json({ error: 'Missing task_id' });
 
-  // Require and validate API key
-  const authHeader = req.headers['authorization'];
-  if (!authHeader) return res.status(401).json({ error: 'API key required' });
-  const apiKey = authHeader.split(' ')[1];
-  if (!apiKey) return res.status(401).json({ error: 'API key required' });
-  // Validate API key and get userEmail
-  const userId = await getUserIdFromApiKey(apiKey);
-  if (!userId) return res.status(401).json({ error: 'Invalid API key' });
+  // Require and validate Authorization (API key or JWT)
+  const authHeader = req.headers['authorization'] as string | undefined;
+  const auth = await getUserIdFromAuthHeader(authHeader);
+  if (!auth.userId) return res.status(401).json({ error: 'Unauthorized' });
+  const userId = auth.userId;
   const userClient = getUserSupabaseClient(userId);
   const { data: profileData } = await userClient
     .from('profiles')
     .select('email')
     .eq('id', userId)
     .single();
-  const userEmail = profileData?.email;
-  const apiKeyPrefix = apiKey.slice(0, 12);
+  const userEmail = profileData?.email || auth.userEmail || null;
+  const apiKeyPrefix = auth.apiKey ? auth.apiKey.slice(0, 12) : null;
 
   try {
     let result;
@@ -4668,7 +4697,26 @@ router.get('/v1/completions/result/:task_id', async (req, res) => {
       });
       result = falRes.data;
     }
-    // Deduct a fixed cost (e.g., $0.01 = 1 cent) for image generation
+
+    // Determine if the generation was successful
+    let isSuccess = false;
+    let isFailed = false;
+    let isProcessing = false;
+
+    // Check for success indicators (adjust for different models if needed)
+    if (result.status === 'COMPLETED' &&
+      ((result.images && result.images.length > 0) ||
+        (result.videos && result.videos.length > 0) ||
+        (result.audio && result.audio) ||
+        (result.model && result.model.url))) {
+      isSuccess = true;
+    } else if (result.status === 'FAILED' || result.error || result.logs?.errors?.length > 0) {
+      isFailed = true;
+    } else if (result.status === 'PROCESSING' || result.status === 'PENDING') {
+      isProcessing = true;
+    }
+
+    // Deduct a fixed cost only if successful
     let wasDeducted = false;
     let actualCostCents = 0;
 
@@ -4686,44 +4734,72 @@ router.get('/v1/completions/result/:task_id', async (req, res) => {
     if (originalLog && originalLog.final_cost_usd_cents) {
       actualCostCents = originalLog.final_cost_usd_cents;
       console.log(`[RESULT ENDPOINT] Found log for task_id ${task_id}, cost: $${(actualCostCents / 100).toFixed(6)}`);
-      // ATOMIC BALANCE DEDUCTION - NO RACE CONDITION
-      if (userEmail) {
-        const { data: updateResult, error: updateError } = await getUserSupabaseClient(userId)
-          .rpc('deduct_balance_atomic', {
-            p_user_id: userId,
-            p_amount_cents: actualCostCents
-          });
 
-        if (!updateError && updateResult && updateResult.success) {
-          wasDeducted = true;
-          console.log('✅ [ATOMIC] Balance deducted successfully. New balance:', updateResult.new_balance, 'cents');
-          // Update the original log to mark it as deducted
-          await getUserSupabaseClient(userId)
-            .from('api_logs')
-            .update({ was_deducted: true })
-            .eq('id', originalLog.id);
-        } else {
-          console.log('❌ [ATOMIC] Balance deduction failed:', updateError?.message);
-          // Return error to prevent double-spending
-          return res.status(402).json({
-            error: 'Insufficient balance or balance update failed'
-          });
+      if (isSuccess) {
+        // Only deduct if successful
+        // ATOMIC BALANCE DEDUCTION - NO RACE CONDITION
+        if (userEmail) {
+          const { data: updateResult, error: updateError } = await getUserSupabaseClient(userId)
+            .rpc('deduct_balance_atomic', {
+              p_user_id: userId,
+              p_amount_cents: actualCostCents
+            });
+
+          if (!updateError && updateResult && updateResult.success) {
+            wasDeducted = true;
+            console.log('✅ [ATOMIC] Balance deducted successfully. New balance:', updateResult.new_balance, 'cents');
+            // Update the original log to mark it as deducted and successful
+            await getUserSupabaseClient(userId)
+              .from('api_logs')
+              .update({ was_deducted: true, status_code_returned: 200 })
+              .eq('log_id', originalLog.log_id);
+          } else {
+            console.log('❌ [ATOMIC] Balance deduction failed:', updateError?.message);
+            // Return error to prevent double-spending
+            return res.status(402).json({
+              error: 'Insufficient balance or balance update failed'
+            });
+          }
         }
+      } else if (isFailed) {
+        // Update log to reflect failure: no charge, status 500
+        await getUserSupabaseClient(userId)
+          .from('api_logs')
+          .update({
+            was_deducted: false,
+            status_code_returned: 500,
+            final_cost_usd_cents: 0,
+            inference_usage_json: {
+              ...originalLog.inference_usage_json,
+              status: 'failed',
+              error: result.error || result.logs?.errors || 'Generation failed'
+            }
+          })
+          .eq('log_id', originalLog.log_id);
+        actualCostCents = 0;
+        console.log(`[RESULT ENDPOINT] Marked task_id ${task_id} as failed, no charge applied`);
+      } else if (isProcessing) {
+        // Still processing, no action on log or balance
+        actualCostCents = 0;
+        console.log(`[RESULT ENDPOINT] Task ${task_id} still processing, no charge yet`);
       }
     } else {
-      console.warn(`[RESULT ENDPOINT] No log found for task_id ${task_id}, returning fallback cost.`);
-      // Fallback to $0.02 if we can't find the original request
-      actualCostCents = 2;
+      console.warn(`[RESULT ENDPOINT] No log found for task_id ${task_id}, returning fallback cost 0.`);
+      actualCostCents = 0;
     }
-    // Attach _cost_info to the result before sending
+
+    // Attach _cost_info to the result before sending (0 if not charged)
     result._cost_info = {
       cost_usd: actualCostCents / 100,
       cost_cents: actualCostCents,
       model: originalLog?.inference_usage_json?.model || appId,
-      provider: originalLog?.inference_usage_json?.provider || 'capx_ivmodels'
+      provider: originalLog?.inference_usage_json?.provider || 'capx_ivmodels',
+      status: isSuccess ? 'success' : (isFailed ? 'failed' : (isProcessing ? 'processing' : 'unknown'))
     };
-    console.log(`[RESULT ENDPOINT] Returning result for task_id ${task_id} with cost_usd: $${(actualCostCents / 100).toFixed(6)}`);
+
+    console.log(`[RESULT ENDPOINT] Returning result for task_id ${task_id} with cost_usd: $${(actualCostCents / 100).toFixed(6)}, status: ${result._cost_info.status}`);
     res.json(result);
+
   } catch (err) {
     let errorMsg = 'Unknown error';
     let errorDetails = undefined;

@@ -5,9 +5,9 @@ import { body, query, param, validationResult } from 'express-validator';
 import crypto from 'crypto';
 import { AppError } from '../index';
 import jwt from 'jsonwebtoken';
-import { 
-  generateSecureApiKey, 
-  createApiKeyMetadata, 
+import {
+  generateSecureApiKey,
+  createApiKeyMetadata,
   sanitizeApiKeyData,
   isValidApiKeyFormat,
   extractApiKeyPrefix
@@ -28,7 +28,6 @@ function isEthereumAddress(str: string): boolean {
 // Custom validator for user_email or wallet address
 function isEmailOrEthAddress(value: string) {
   if (typeof value !== 'string') return false;
-  // Accept if valid email or valid Ethereum address
   return isEthereumAddress(value) || /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(value);
 }
 
@@ -36,23 +35,23 @@ function isEmailOrEthAddress(value: string) {
 const authenticateUser = (req: Request, res: Response, next: NextFunction) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: 'Authentication required' });
-  
+
   try {
     // Use pre-validated public key from index.ts
     if (!jwtPublicKey) {
       return res.status(500).json({ error: 'JWT public key not configured' });
     }
-    
-    const decoded = jwt.verify(token, jwtPublicKey, { 
+
+    const decoded = jwt.verify(token, jwtPublicKey, {
       algorithms: ['RS256'],
       issuer: 'https://api.ai4everyone.com',
       audience: 'ai4everyone-api'
     });
-    
+
     // ✅ SECURE: Device fingerprint verification moved to session-based validation
     // The fingerprint is now stored in the session, not in the JWT
     // This provides better security as session data is server-side only
-    
+
     (req as any).user = decoded;
     next();
   } catch (error) {
@@ -63,11 +62,11 @@ const authenticateUser = (req: Request, res: Response, next: NextFunction) => {
 // GET /api-keys - fetch all API keys for the authenticated user
 router.get('/', authenticateUser, async (req: Request, res: Response) => {
   const user_id = (req as any).user.sub; // From authenticated token (sub claim)
-  
+
   try {
     // Use user-scoped client for secure access
     const userClient = getUserSupabaseClient(user_id);
-    
+
     // Use direct table query since the view has RLS issues
     const { data, error } = await userClient
       .from('api_keys')
@@ -75,12 +74,12 @@ router.get('/', authenticateUser, async (req: Request, res: Response) => {
       .eq('user_id', user_id)
       .eq('is_active', true)
       .order('created_at', { ascending: false });
-      
+
     if (error) {
       console.error('Error fetching API keys:', error);
       return res.status(500).json({ error: 'Failed to fetch API keys' });
     }
-    
+
     // Return sanitized data (no sensitive fields)
     res.json(data);
   } catch (err) {
@@ -100,68 +99,86 @@ router.post('/', authenticateUser, [
   if (!errors.isEmpty()) {
     return res.status(400).json({ errors: errors.array() });
   }
-  
+
   const user_id = (req as any).user.sub; // From authenticated token (sub claim)
   const user_email = (req as any).user.email;
   const { name, replace_existing } = req.body;
-  
+
   if (!name) return res.status(400).json({ error: 'Missing name' });
-  
+
   try {
     // Use user-scoped client for secure access
     const userClient = getUserSupabaseClient(user_id);
-    
+
     // Fetch existing ACTIVE keys for this user
     const { data: existingKeys, error: fetchKeysError } = await userClient
       .from('api_keys')
       .select('id')
       .eq('user_id', user_id)
       .eq('is_active', true);
-      
+
     if (fetchKeysError) {
       console.error('Error fetching existing API keys:', fetchKeysError);
       return res.status(500).json({ error: 'Failed to fetch existing API keys' });
     }
-    
+
     if (existingKeys && existingKeys.length >= 5 && !replace_existing) {
       return res.status(400).json({ error: 'Maximum 5 API keys per user' });
     }
-    
+
     // Only delete all keys if explicitly requested
     if (replace_existing) {
       const { error: deleteError } = await userClient
         .from('api_keys')
         .delete()
         .eq('user_id', user_id);
-        
+
       if (deleteError) {
         console.error('Error deleting old API keys:', deleteError);
         return res.status(500).json({ error: 'Failed to delete old API keys' });
       }
     }
-    
+
+    // Enforce unique API key name per user (case-insensitive)
+    const { data: duplicateByName, error: dupNameError } = await userClient
+      .from('api_keys')
+      .select('id')
+      .eq('user_id', user_id)
+      .eq('is_active', true)
+      .ilike('name', name) // case-insensitive exact match
+      .limit(1);
+
+    if (dupNameError) {
+      console.error('Error checking duplicate API key name:', dupNameError);
+      return res.status(500).json({ error: 'Failed to validate API key name' });
+    }
+
+    if (duplicateByName && duplicateByName.length > 0) {
+      return res.status(409).json({ error: 'API key name already exists' });
+    }
+
     // Generate secure API key with metadata
     const { metadata, secureKey } = await createApiKeyMetadata(user_id, user_email, name);
-    
+
     // Insert the new API key using user-scoped client (NO PLAINTEXT STORAGE)
     const { data, error } = await userClient
       .from('api_keys')
-      .insert([{ 
-        id: uuidv4(), 
+      .insert([{
+        id: uuidv4(),
         ...metadata
         // ✅ SECURE: No plaintext storage - only hash, prefix, checksum, salt
       }])
       .select()
       .single();
-      
+
     if (error) {
       console.error('Error inserting API key:', error);
       return res.status(500).json({ error: 'Failed to create API key' });
     }
-    
+
     // ✅ SECURE: Return plaintext only once, never stored in database
-    res.status(201).json({ 
-      ...sanitizeApiKeyData(data as any), 
+    res.status(201).json({
+      ...sanitizeApiKeyData(data as any),
       key: secureKey.plaintext  // Return plaintext only once for user to copy
     });
   } catch (err) {
@@ -178,39 +195,39 @@ router.delete('/:id', authenticateUser, [
   if (!errors.isEmpty()) {
     return res.status(400).json({ errors: errors.array() });
   }
-  
+
   const user_id = (req as any).user.sub; // From authenticated token (sub claim)
   const { id } = req.params;
-  
+
   if (!id) return res.status(400).json({ error: 'Missing id' });
-  
+
   try {
     // Use user-scoped client for secure access
     const userClient = getUserSupabaseClient(user_id);
-    
+
     // Soft delete: set is_active to false instead of hard delete
     const { data, error, count } = await userClient
       .from('api_keys')
       .update({ is_active: false })
       .match({ id: id, user_id: user_id })
       .select();
-      
+
     if (error) {
       console.error('Error deactivating API key:', error);
       return res.status(500).json({ error: 'Failed to deactivate API key' });
     }
-    
+
     if (count === 0) {
       return res.status(404).json({ error: 'API key not found or unauthorized' });
     }
-    
+
     // Audit the security event
     await supabaseAnon.rpc('audit_security_event', {
       p_event_type: 'api_key_deactivated',
       p_user_id: user_id,
       p_details: { key_id: id }
     });
-    
+
     res.status(204).end();
   } catch (err) {
     console.error('Unexpected error in DELETE /api-keys/:id:', err);

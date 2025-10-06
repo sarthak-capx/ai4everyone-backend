@@ -130,13 +130,15 @@ export function getSessionMiddleware() {
         throw new Error('SESSION_SECRET must be set and at least 32 characters long');
     }
 
+    const isProd = process.env.NODE_ENV === 'production';
+
     const sessionConfig: session.SessionOptions = {
         secret: process.env.SESSION_SECRET as string,
         name: 'ai4everyone.sid',
         cookie: {
             httpOnly: true,
-            secure: process.env.NODE_ENV === 'production',
-            sameSite: 'strict',
+            secure: isProd,
+            sameSite: isProd ? 'none' : 'lax',
             maxAge: 24 * 60 * 60 * 1000,
             path: '/'
         },
@@ -146,7 +148,7 @@ export function getSessionMiddleware() {
         unset: 'destroy'
     };
 
-    if (process.env.NODE_ENV === 'production') {
+    if (isProd) {
         sessionConfig.store = new ProductionSessionStore();
     } else {
         sessionConfig.store = new session.MemoryStore();

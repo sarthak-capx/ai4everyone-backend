@@ -170,6 +170,22 @@ router.post('/verify-payment', async (req: Request, res: Response) => {
             if (updateError || !(updateResult as any)?.success) {
                 return res.status(500).json({ error: 'Failed to update user balance' });
             }
+
+            // Insert into transactions table for Usage page stats
+            const { error: txError } = await supabase
+                .from('transactions')
+                .insert({
+                    hash: txHash,
+                    user_id: userId,
+                    amount: usdAmount,  // Positive amount for top-up
+                    created_at: new Date().toISOString()
+                });
+
+            if (txError) {
+                console.error('Failed to insert transaction record:', txError);
+                // Don't fail the response, just log the error
+            }
+
             await supabase.rpc('audit_security_event', { p_event_type: 'payment_verified', p_user_id: userId, p_details: { chainId, txHash, receiptId, usdAmount } });
             return res.status(200).json({ success: true, newBalance: (updateResult as any).new_balance / 100 });
         } catch {
